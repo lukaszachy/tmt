@@ -126,6 +126,13 @@ def name_filter_condition(function: Callable[..., Any]) -> Callable[..., Any]:
     return function
 
 
+
+def source(function):
+    return click.option(
+        '--source', is_flag=True, help="#FIXME Operate on files than on names"
+        )(function)
+
+
 def name_filter_condition_long(function: Callable[..., Any]) -> Callable[..., Any]:
     """ Common filter options (long only) """
     options = [
@@ -433,6 +440,7 @@ def tests_show(context: click.core.Context, **kwargs: Any) -> None:
 @tests.command(name='lint')
 @click.pass_context
 @name_filter_condition
+@source
 @fix
 @verbose_debug_quiet
 def tests_lint(context: click.core.Context, **kwargs: Any) -> None:
