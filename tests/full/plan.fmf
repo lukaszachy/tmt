@@ -1,5 +1,6 @@
 discover:
     how: fmf
+    sync-repo: true
 provision:
     how: virtual
     memory: 4000

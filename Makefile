@@ -26,6 +26,14 @@ coverage: tmp
 	coverage run --source=tmt,bin -m pytest -vvv -ra --showlocals tests
 	coverage report
 	coverage annotate
+# tests/full but with local state of the repo
+# We need to escape fmf root placed in tests/full
+vmtest:
+	test -d tests/full/repo_copy && rm -rf tests/full/repo_copy || true
+	mkdir -p tests/full/repo_copy
+	rsync -a --exclude tests/full/repo_copy $(CURDIR)/ tests/full/repo_copy
+	cd tests/full && tmt run -vvv -e COPY_IN=1 -a discover -h fmf --sync-repo
+
 # Regenerate test data for integration tests
 # remove selected/all response files in tests/integration/test_data directory
 requre:

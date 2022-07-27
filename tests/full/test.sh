@@ -7,8 +7,17 @@ USER_HOME="/home/$USER"
 
 CONNECT_RUN="/tmp/CONNECT"
 
+# Where to get sources from?
+# Set to '1' to use local checkout, otherwise git clone happens
+# Plan cannot copy it to the right location so user is expected
+# to do so (tests/full/repo_copy/.git has to exist as well)
+COPY_IN="${COPY_IN:-0}"
+
+# Set to desired tag/branch/commit (instead of the default branch)
+# Used only if COPY_IN not equal 1
 BRANCH="${BRANCH:-}"
-# Set following to 1 if you are running pre-relase
+
+# Set to '1' to keep tmt.spec as is
 PRE_RELEASE="${PRE_RELEASE:-0}"
 
 # Set to `test <options>` for test filtering
@@ -18,11 +27,6 @@ set -o pipefail
 
 rlJournalStart
     rlPhaseStartSetup
-
-        if [[ $PRE_RELEASE -eq 1 ]]; then
-            [[ -z "$BRANCH" ]] && rlDie "Please set BRANCH when running pre-release"
-        fi
-
         if ! rlIsFedora; then
             rlRun "rlImport epel/epel"
             rlRun "dnf config-manager --set-enabled epel"
@@ -34,7 +38,7 @@ rlJournalStart
                 fi
             done
 
-            #better to install SOME tmt than none (python3-html2text missing on rhel-9)
+            # Better to install SOME tmt than none (python3-html2text missing on rhel-9)
             SKIP_BROKEN="--skip-broken"
         fi
 
@@ -53,12 +57,21 @@ rlJournalStart
         # Making sure USER can r/w to the /var/tmp/tmt
         test -d /var/tmp/tmt && rlRun "chown $USER:$USER /var/tmp/tmt"
 
-        # Clone repo
-        rlRun "git clone https://github.com/teemtee/tmt $USER_HOME/tmt"
-        rlRun "pushd $USER_HOME/tmt"
-        [ -n "$BRANCH" ] && rlRun "git checkout --force '$BRANCH'"
+        # Use repo copied to tests/full/repo_copy directory
+        # see `make vmtest` what is being done as this can't be part of the plan
+        # as it is outside of the current fmf root
+        if [[ $COPY_IN -eq 1 ]]; then
+            rlRun "mv repo_copy $USER_HOME/tmt"
+            rlRun "pushd $USER_HOME/tmt"
+        else
+            # Clone repo otherwise
+            rlRun "git clone https://github.com/teemtee/tmt $USER_HOME/tmt"
+            rlRun "pushd $USER_HOME/tmt"
+            [ -n "$BRANCH" ] && rlRun "git checkout --force '$BRANCH'"
+        fi
         # Make current commit visible in the log
         rlRun "git show -s | cat"
+
         # Do not "patch" version for pre-release...
         [[ $PRE_RELEASE -ne 1 ]] && rlRun "sed 's/^Version:.*/Version: 9.9.9/' -i tmt.spec"
 
@@ -66,7 +79,7 @@ rlJournalStart
         rlRun "dnf builddep -y tmt.spec" 0 "Install build dependencies"
         rlRun "make rpm" || rlDie "Failed to build tmt rpms"
 
-        # From now one we can use tmt (freshly built)
+        # After this we can use tmt (install freshly built rpms)
         rlRun "find $USER_HOME/tmt/tmp/RPMS -type f -name '*rpm' | xargs dnf install -y $SKIP_BROKEN"
 
         # Make sure that libvirt is running
@@ -108,6 +121,7 @@ rlJournalStart
 
         # Delete the plan -> container vs host are not synced so rpms might not be installable
         rlRun 'rm -f plans/install/minimal.fmf'
+        # Make all local changes visible in the log
         rlRun "git diff | cat"
         if [ -z "$PLANS" ]; then
             rlRun "su -l -c 'cd $USER_HOME/tmt; tmt -c how=full plans ls --filter=enabled:true > $USER_HOME/enabled_plans' $USER"
