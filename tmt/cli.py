@@ -126,8 +126,7 @@ def name_filter_condition(function: Callable[..., Any]) -> Callable[..., Any]:
     return function
 
 
-
-def source(function):
+def source(function: Callable[..., Any]) -> Callable[..., Any]:
     return click.option(
         '--source', is_flag=True, help="Select by fmf source file names instead of object names."
         )(function)
