@@ -655,7 +655,7 @@ class GuestSsh(Guest):
             self._ssh_socket_path = tempfile.mktemp(dir=socket_dir)
         return self._ssh_socket_path
 
-    def _ssh_options(self, join=False):
+    def _ssh_options(self, join=False, shared_connection=True):
         """ Return common ssh options (list or joined) """
         options = [
             '-oForwardX11=no',
@@ -675,7 +675,8 @@ class GuestSsh(Guest):
             options.extend(['-oPasswordAuthentication=yes'])
 
         # Use the shared master connection
-        options.append(f'-S{self._ssh_socket()}')
+        if shared_connection:
+            options.append(f'-S{self._ssh_socket()}')
 
         return ' '.join(options) if join else options
 
@@ -690,8 +691,9 @@ class GuestSsh(Guest):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
+        print(f"XXX master {self._ssh_master_process.pid}")
 
-    def _ssh_command(self, join=False):
+    def _ssh_command(self, join=False, shared_connection=True):
         """ Prepare an ssh command line for execution (list or joined) """
         command = []
         if self.password:
@@ -700,12 +702,14 @@ class GuestSsh(Guest):
         command.append("ssh")
 
         # Check the master connection
-        self._ssh_master_connection(command)
+        if shared_connection:
+            self._ssh_master_connection(command)
 
         if join:
-            return " ".join(command) + " " + self._ssh_options(join=True)
+            return " ".join(command) + " " + self._ssh_options(join=True,
+                                                               shared_connection=shared_connection)
         else:
-            return command + self._ssh_options()
+            return command + self._ssh_options(shared_connection=shared_connection)
 
     def ansible(self, playbook, extra_args=None):
         """ Prepare guest using ansible playbook """
@@ -752,9 +756,13 @@ class GuestSsh(Guest):
         if isinstance(command, (list, tuple)):
             command = ' '.join(command)
         self.debug(f"Execute command '{command}' on guest '{self.guest}'.")
-        command = (
-            self._ssh_command() + interactive + [self._ssh_guest()] +
-            [f'{environment}{directory}{command}'])
+        shared_connection = kwargs.get('shared_connection', None)
+        if shared_connection is not None:
+            del kwargs['shared_connection']
+        else:
+            shared_connection = True
+        command = (self._ssh_command(shared_connection=shared_connection) +
+                   interactive + [self._ssh_guest()] + [f'{environment}{directory}{command}'])
         return self.run(command, **kwargs)
 
     def push(self, source=None, destination=None, options=None):

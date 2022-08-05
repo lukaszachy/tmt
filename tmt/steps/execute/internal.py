@@ -195,7 +195,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             stdout, stderr = guest.execute(
                 command, cwd=workdir, env=environment,
                 join=True, interactive=self.get('interactive'), log=log,
-                timeout=tmt.utils.duration_to_seconds(test.duration))
+                timeout=tmt.utils.duration_to_seconds(test.duration), shared_connection=False)
             test.returncode = 0
         except tmt.utils.RunError as error:
             stdout = error.stdout

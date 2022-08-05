@@ -1,0 +1,16 @@
+/plan:
+  discover:
+    how: fmf
+    test:
+    - /REPRO/direct
+    - /REPRO/inner
+  execute:
+    how: tmt
+
+/direct:
+  duration: 2s
+  test: sleep 10000
+
+/inner:
+  duration: 2s
+  test: bash repro.sh
