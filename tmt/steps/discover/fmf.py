@@ -335,13 +335,13 @@ class DiscoverFmf(tmt.steps.discover.DiscoverPlugin):
 
         # Check for a presense of a file with rules for ref
         # either following special syntax ref: @filepath
-        if ref and ref[0] == '@':
+        if ref and str(ref)[0:1] == '@':
             ref_filepath = os.path.join(self.testdir, ref[1:])
         # or using the default location
         else:
             ref_filepath = os.path.join(self.testdir, ".tmt/ref.fmf")
         # dynamic ref check is enabled when ref is not defined or when it starts with @
-        if (not ref or ref[0] == '@'):
+        if (not ref or str(ref)[0:1] == '@'):
             if os.path.exists(ref_filepath):
                 self.debug(f"Dynamic 'ref' definition file '{ref_filepath}' exists")
                 # there is a file with rules
@@ -362,7 +362,7 @@ class DiscoverFmf(tmt.steps.discover.DiscoverPlugin):
             # there is no dynamic ref file
             else:
                 # if dynamic ref file was specified using @ but not found raise an exception
-                if ref and ref[0] == '@':
+                if ref and str(ref)[0:1] == '@':
                     raise tmt.utils.DiscoverError(
                         f"Dynamic 'ref' definition file '{ref_filepath}' does not exist.")
                 else:
