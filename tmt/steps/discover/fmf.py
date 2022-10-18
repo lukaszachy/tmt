@@ -351,13 +351,9 @@ class DiscoverFmf(tmt.steps.discover.DiscoverPlugin):
                         data = tmt.utils.yaml_to_dict(datafile.read())
                 except OSError as error:
                     raise tmt.utils.FileError(f"Failed to read '{ref_filepath}'.\n{error}")
-                # we need to built a dummy tree and a plan so we can evaluate fmf data
-                dummy_parent = fmf.Tree({'summary': 'unused'})
-                dummy_node = fmf.Tree({'execute': None}, name="ref", parent=dummy_parent)
-                dummy_node.update(data)
-                dummy_node.adjust(fmf.context.Context(**self._fmf_context()))
-                dummy_plan = tmt.Plan(node=dummy_node, run=None, skip_validation=True)
-                dummy_plan._expand_node_data(dummy_node.data)
+                # we need to built a dummy tree so we can evaluate fmf data
+                dummy_node = fmf.Tree(data=data)
+                dummy_node.adjust(fmf.context.Context(**self.step.plan._fmf_context()))
                 ref = dummy_node.get("environment").get("REF", None)
             # there is no dynamic ref file
             else:
