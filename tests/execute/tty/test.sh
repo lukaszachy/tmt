@@ -36,7 +36,7 @@ rlJournalStart
         rlPhaseEnd
 
         rlPhaseStartTest "With $method provision method, interactive tests"
-            rlRun "tmt run -avvvvddd provision -h $method execute -h tmt --interactive |& tee output.txt"
+            rlRun "../pypty.py 'tmt run -avvvvddd provision -h $method execute -h tmt --interactive' |& tee output.txt"
 
             rlAssertGrep "out: prepare: stdin: False" output.txt
             rlAssertGrep "out: prepare: stdout: False" output.txt
