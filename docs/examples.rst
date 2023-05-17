@@ -234,7 +234,7 @@ Use ``tmt test create`` to create a new test based on a template::
 Specify templates non-interactively with ``-t`` or ``--template``::
 
     $ tmt tests create --template shell /tests/smoke
-    $ tmt tests create --t beakerlib /tests/smoke
+    $ tmt tests create -t beakerlib /tests/smoke
 
 Use ``-f`` or ``--force`` option to overwrite existing files.
 
@@ -492,7 +492,7 @@ and detailed plan information, respectively::
           filter tier: 0,1
          prepare
              how ansible
-        playbook plans/packages.yml
+        playbook ansible/packages.yml
 
     /plans/helps
          summary Check help messages
@@ -515,7 +515,7 @@ Create Plans
 Use ``tmt plan create`` to create a new plan with templates::
 
     tmt plans create --template mini /plans/smoke
-    tmt plans create --t full /plans/features
+    tmt plans create -t full /plans/features
 
 In order to override default template content directly from the
 command line use individual step options and provide desired data
@@ -596,7 +596,7 @@ step could look like this::
     prepare:
       - name: packages
         how: ansible
-        playbook: plans/packages.yml
+        playbook: ansible/packages.yml
       - name: services
         how: shell
         script: systemctl start service
@@ -1579,20 +1579,19 @@ Coding
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If you want to perform more advanced processing of the metadata
-which is not supported by the command line use Python.  Just
-import the ``tmt`` module and create a logger for debugging::
+which is not supported by the command line use Python. To get
+quickly started just import the ``tmt`` module and grow a new
+``tmt.Tree`` object::
 
     import tmt
-    from tmt.utils import Path
 
-    tree = tmt.Tree.grow(path=Path("/path/to/the/tree"))
+    tree = tmt.Tree.grow()
 
     for test in tree.tests():
         print(test.name)
 
-You might also want to explore all available plugins if you need
-to work with metadata export::
+Use the ``tmt.utils.Path`` class when specifying paths::
 
-    tmt.plugins.explore()
-    for plan in tree.plans():
-        print(plan.export(format="yaml"))
+    from tmt.utils import Path
+
+    tree = tmt.Tree.grow(path=Path("/path/to/the/tree"))

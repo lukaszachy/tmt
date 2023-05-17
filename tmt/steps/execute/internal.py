@@ -1,8 +1,8 @@
 import dataclasses
+import datetime
 import json
 import os
 import sys
-import time
 from typing import Any, Dict, List, Optional, cast
 
 import click
@@ -150,6 +150,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
 
         environment["TMT_TEST_NAME"] = test.name
         environment["TMT_TEST_DATA"] = str(data_directory / tmt.steps.execute.TEST_DATA)
+        environment['TMT_TEST_SERIAL_NUMBER'] = str(test.serialnumber)
         environment["TMT_TEST_METADATA"] = str(
             data_directory / tmt.steps.execute.TEST_METADATA_FILENAME)
         environment["TMT_REBOOT_REQUEST"] = str(
@@ -176,16 +177,21 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
         """ Custom logger for test output with shift 2 and level 3 defaults """
         self.verbose(key=key, value=value, color=color, shift=shift, level=level)
 
-    def execute(self, test: Test, guest: Guest,
-                extra_environment: Optional[EnvironmentType] = None) -> None:
+    def execute(
+            self,
+            *,
+            test: Test,
+            guest: Guest,
+            extra_environment: Optional[EnvironmentType] = None,
+            logger: tmt.log.Logger) -> None:
         """ Run test on the guest """
-        self.debug(f"Execute '{test.name}' as a '{test.framework}' test.")
+        logger.debug(f"Execute '{test.name}' as a '{test.framework}' test.")
 
         # Test will be executed in it's own directory, relative to the workdir
         assert self.discover.workdir is not None  # narrow type
         assert test.path is not None  # narrow type
         workdir = self.discover.workdir / test.path.unrooted()
-        self.debug(f"Use workdir '{workdir}'.", level=3)
+        logger.debug(f"Use workdir '{workdir}'.", level=3)
 
         # Create data directory, prepare test environment
         environment = self._test_environment(test, guest, extra_environment)
@@ -197,7 +203,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             test_command = ShellScript(f"{tmt.utils.SHELL_OPTIONS}; {test.test}")
         else:
             test_command = test.test
-        self.debug('Test script', str(test_command), level=3)
+        logger.debug('Test script', str(test_command), level=3)
 
         # Prepare the wrapper, push to guest
         self.write(test_wrapper_filepath, str(test_command), 'w')
@@ -218,8 +224,23 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
                 TEST_WRAPPER_NONINTERACTIVE.format(
                     remote_command=remote_command))
 
+        def _test_output_logger(
+                key: str,
+                value: Optional[str] = None,
+                color: Optional[str] = None,
+                shift: int = 2,
+                level: int = 3,
+                topic: Optional[tmt.log.Topic] = None) -> None:
+            logger.verbose(
+                key=key,
+                value=value,
+                color=color,
+                shift=shift,
+                level=level,
+                topic=topic)
+
         # Execute the test, save the output and return code
-        start = time.time()
+        starttime = datetime.datetime.now(datetime.timezone.utc)
         try:
             stdout, _ = guest.execute(
                 remote_command,
@@ -227,7 +248,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
                 env=environment,
                 join=True,
                 interactive=self.get('interactive'),
-                log=self._test_output_logger,
+                log=_test_output_logger,
                 timeout=tmt.utils.duration_to_seconds(test.duration),
                 test_session=True,
                 friendly_command=str(test.test))
@@ -236,12 +257,15 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             stdout = error.stdout
             test.returncode = error.returncode
             if test.returncode == tmt.utils.PROCESS_TIMEOUT:
-                self.debug(f"Test duration '{test.duration}' exceeded.")
-        end = time.time()
+                logger.debug(f"Test duration '{test.duration}' exceeded.")
+        endtime = datetime.datetime.now(datetime.timezone.utc)
         self.write(
             self.data_path(test, guest, TEST_OUTPUT_FILENAME, full=True),
             stdout or '', mode='a', level=3)
-        test.real_duration = self.test_duration(start, end)
+
+        test.starttime = self.format_timestamp(starttime)
+        test.endtime = self.format_timestamp(endtime)
+        test.real_duration = self.format_duration(endtime - starttime)
 
     def check(self, test: Test, guest: Guest) -> List[Result]:
         """ Check the test result """
@@ -322,19 +346,20 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             logger: tmt.log.Logger) -> None:
         """ Execute available tests """
         super().go(guest=guest, environment=environment, logger=logger)
-        self._results: List[Result] = []
 
         # Nothing to do in dry mode
         if self.opt('dry'):
             self._results = []
             return
 
-        self._run_tests(guest)
+        self._run_tests(guest=guest, extra_environment=environment, logger=logger)
 
     def _run_tests(
             self,
+            *,
             guest: Guest,
-            extra_environment: Optional[EnvironmentType] = None) -> None:
+            extra_environment: Optional[EnvironmentType] = None,
+            logger: tmt.log.Logger) -> None:
         """ Execute tests on provided guest """
 
         # Prepare tests and helper scripts, check options
@@ -354,10 +379,14 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
 
             progress = f"{index + 1}/{len(tests)}"
             self._show_progress(progress, test.name)
-            self.verbose(
+            logger.verbose(
                 'test', test.summary or test.name, color='cyan', shift=1, level=2)
 
-            self.execute(test, guest, extra_environment=extra_environment)
+            self.execute(
+                test=test,
+                guest=guest,
+                extra_environment=extra_environment,
+                logger=logger)
 
             # Pull test logs from the guest, exclude beakerlib backups
             if test.framework == "beakerlib":
@@ -378,7 +407,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             # Handle reboot, abort, exit-first
             if self._will_reboot(test, guest):
                 # Output before the reboot
-                self.verbose(
+                logger.verbose(
                     f"{duration} {test.name} [{progress}]", shift=shift)
                 try:
                     if self._handle_reboot(test, guest):
@@ -396,7 +425,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             for result in results:
                 # If test duration information is missing, print 8 spaces to keep indention
                 duration = click.style(result.duration, fg='cyan') if result.duration else 8 * ' '
-                self.verbose(f"{duration} {result.show()} [{progress}]", shift=shift)
+                logger.verbose(f"{duration} {result.show()} [{progress}]", shift=shift)
             if (abort or exit_first and
                     result.result not in (ResultOutcome.PASS, ResultOutcome.INFO)):
                 # Clear the progress bar before outputting
@@ -411,6 +440,7 @@ class ExecuteInternal(tmt.steps.execute.ExecutePlugin):
             # --test" option is provided
             if self._login_after_test:
                 assert test.path is not None  # narrow type
+
                 if self.discover.workdir is None:
                     cwd = test.path.unrooted()
                 else:

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
 import click
 
+import tmt.lint
 import tmt.log
 import tmt.utils
 
@@ -174,6 +175,47 @@ REMOTE_PLAN_OPTIONS: List[ClickOptionDecoratorType] = [
     ]
 
 
+_lint_outcomes = [member.value for member in tmt.lint.LinterOutcome.__members__.values()]
+
+LINT_OPTIONS: List[ClickOptionDecoratorType] = [
+    click.option(
+        '--list-checks',
+        is_flag=True,
+        help='List all available checks.'),
+    click.option(
+        '--enable-check',
+        'enable_checks',
+        metavar='CHECK-ID',
+        multiple=True,
+        type=str,
+        help='Run only checks mentioned by this option.'),
+    click.option(
+        '--disable-check',
+        'disable_checks',
+        metavar='CHECK-ID',
+        multiple=True,
+        type=str,
+        help='Do not run checks mentioned by this option.'),
+    click.option(
+        '--enforce-check',
+        'enforce_checks',
+        metavar='CHECK-ID',
+        multiple=True,
+        type=str,
+        help='Consider linting as failed if any of the checks is not a pass.'),
+    click.option(
+        '--failed-only',
+        is_flag=True,
+        help='Display only tests/plans/stories that fail a check.'),
+    click.option(
+        '--outcome-only',
+        metavar='|'.join(_lint_outcomes),
+        multiple=True,
+        type=click.Choice(_lint_outcomes),
+        help='Display only checks with the given outcome.')
+    ]
+
+
 def create_options_decorator(options: List[ClickOptionDecoratorType]) -> Callable[[FC], FC]:
     def common_decorator(fn: FC) -> FC:
         for option in reversed(options):
@@ -185,50 +227,50 @@ def create_options_decorator(options: List[ClickOptionDecoratorType]) -> Callabl
 
 
 def show_step_method_hints(
-        log_object: tmt.utils.Common,
         step_name: str,
-        how: str) -> None:
+        how: str,
+        logger: tmt.log.Logger) -> None:
     """
     Show hints about available step methods' installation
 
-    The log_object will be used to output the hints to the terminal, hence
+    The logger will be used to output the hints to the terminal, hence
     it must be an instance of a subclass of tmt.utils.Common (info method
     must be available).
     """
     if step_name == 'provision':
         if how == 'virtual':
-            log_object.info(
+            logger.info(
                 'hint', "Install 'tmt-provision-virtual' "
                         "to run tests in a virtual machine.", color='blue')
         if how == 'container':
-            log_object.info(
+            logger.info(
                 'hint', "Install 'tmt-provision-container' "
                         "to run tests in a container.", color='blue')
         if how == 'minute':
-            log_object.info(
+            logger.info(
                 'hint', "Install 'tmt-redhat-provision-minute' "
                         "to run tests in 1minutetip OpenStack backend. "
                         "(Available only from the internal COPR repository.)",
                         color='blue')
-        log_object.info(
+        logger.info(
             'hint', "Use the 'local' method to execute tests "
                     "directly on your localhost.", color='blue')
-        log_object.info(
+        logger.info(
             'hint', "See 'tmt run provision --help' for all "
                     "available provision options.", color='blue')
     elif step_name == 'report':
         if how == 'html':
-            log_object.info(
+            logger.info(
                 'hint', "Install 'tmt-report-html' to format results "
                         "as a html report.", color='blue')
         if how == 'junit':
-            log_object.info(
+            logger.info(
                 'hint', "Install 'tmt-report-junit' to write results "
                         "in JUnit format.", color='blue')
-        log_object.info(
+        logger.info(
             'hint', "Use the 'display' method to show test results "
                     "on the terminal.", color='blue')
-        log_object.info(
+        logger.info(
             'hint', "See 'tmt run report --help' for all "
                     "available report options.", color='blue')
 
@@ -286,7 +328,7 @@ def create_method_class(methods: MethodDictType) -> Type[click.Command]:
                 # Use run for logging, steps may not be initialized yet
                 assert context.obj.run is not None  # narrow type
                 assert self.name is not None  # narrow type
-                show_step_method_hints(context.obj.run, self.name, how)
+                show_step_method_hints(self.name, how, context.obj.run._logger)
                 raise tmt.utils.SpecificationError(
                     f"Unsupported {self.name} method '{how}'.")
 

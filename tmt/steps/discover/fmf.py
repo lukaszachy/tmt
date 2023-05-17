@@ -11,7 +11,7 @@ import fmf
 
 import tmt
 import tmt.base
-import tmt.beakerlib
+import tmt.libraries
 import tmt.log
 import tmt.options
 import tmt.steps
@@ -519,7 +519,10 @@ class DiscoverFmf(tmt.steps.discover.DiscoverPlugin):
         if self.opt('dry'):
             self._tests = []
             return
-        tree = tmt.Tree(logger=self._logger, path=tree_path, context=self.step.plan._fmf_context())
+        tree = tmt.Tree(
+            logger=self._logger,
+            path=tree_path,
+            fmf_context=self.step.plan._fmf_context)
         self._tests = tree.tests(
             filters=filters,
             names=names,
@@ -538,17 +541,35 @@ class DiscoverFmf(tmt.steps.discover.DiscoverPlugin):
             test.path = prefix_path / test.path.unrooted()
             # Check for possible required beakerlib libraries
             if test.require or test.recommend:
-                test.require, test.recommend, _ = tmt.beakerlib.dependencies(
+                test.require, test.recommend, _ = tmt.libraries.dependencies(
                     original_require=test.require,
                     original_recommend=test.recommend,
                     parent=self,
-                    logger=self._logger)
+                    logger=self._logger,
+                    # TODO: Change with pruning for tests
+                    source_location=self.workdir / 'tests',
+                    target_location=self.workdir / 'tests')
+
+        # Cleanup clone directories
+        if self.clone_dirpath.exists():
+            shutil.rmtree(self.clone_dirpath, ignore_errors=True)
 
         # Add TMT_SOURCE_DIR variable for each test
         if dist_git_source:
             for test in self._tests:
                 test.environment['TMT_SOURCE_DIR'] = str(sourcedir)
 
-    def tests(self) -> List[tmt.base.Test]:
+    def tests(
+            self,
+            *,
+            phase_name: Optional[str] = None,
+            enabled: Optional[bool] = None) -> List['tmt.Test']:
         """ Return all discovered tests """
-        return self._tests
+
+        if phase_name is not None and phase_name != self.name:
+            return []
+
+        if enabled is None:
+            return self._tests
+
+        return [test for test in self._tests if test.enabled is enabled]

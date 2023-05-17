@@ -140,20 +140,18 @@ DOMAIN_TEMPLATE = """<domain type='{{ virt_type }}' xmlns:qemu='http://libvirt.o
       <driver name='qemu' type='qcow2' cache='unsafe'/>
       <source file="{{ disk }}"/>
       <target dev='vda' bus='virtio'/>
-      {{ boot_drive_address }}
     </disk>
     <disk type='file' device='disk'>
       <driver name='qemu' type='raw'/>
       <source file="{{ seed }}"/>
       <target dev='vdb' bus='virtio'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x08' function='0x0'/>
     </disk>
+    {{ additional_disks }}
     <interface type='{{ network_type }}'>
       <mac address="{{ mac_address }}"/>
       {{ network_source }}
       {{ ip_setup }}
       <model type='virtio'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
     </interface>
     <serial type='pty'>
       <target port='0'/>
@@ -162,6 +160,7 @@ DOMAIN_TEMPLATE = """<domain type='{{ virt_type }}' xmlns:qemu='http://libvirt.o
       <target type='serial' port='0'/>
     </console>
     <input type="keyboard" bus="virtio"/>
+    {{ tpm }}
     <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
     </rng>
@@ -200,6 +199,7 @@ class TestcloudGuestData(tmt.steps.provision.GuestSshData):
 
     image_url: Optional[str] = None
     instance_name: Optional[str] = None
+    list_local_images: bool = False
 
 
 @dataclasses.dataclass
@@ -355,6 +355,8 @@ class GuestTestcloud(tmt.GuestSsh):
         assert testcloud is not None
         self.config = testcloud.config.get_config()
 
+        self.debug(f"testcloud version: {testcloud.__version__}")
+
         # Make sure download progress is disabled unless in debug mode,
         # so it does not spoil our logging
         self.config.DOWNLOAD_PROGRESS = self.opt('debug') > 2
@@ -432,7 +434,7 @@ class GuestTestcloud(tmt.GuestSsh):
             import guestfs  # noqa: F401
         except ImportError:
             match_legacy = re.search(
-                r'(rhel|centos).*-7', self.image_url.lower())
+                r'(rhel|centos)\D+(6\.|7\.).*', self.image_url.lower())
             if match_legacy:
                 self._instance.pci_net = "e1000"
             else:
@@ -602,11 +604,21 @@ class ProvisionTestcloud(tmt.steps.provision.ProvisionPlugin):
             click.option(
                 '-k', '--key', metavar='PRIVATE_KEY', multiple=True,
                 help='Existing private key for login into the guest system.'),
+            click.option(
+                '--list-local-images', is_flag=True,
+                help="List locally available images."),
             ] + super().options(how)
 
     def go(self) -> None:
         """ Provision the testcloud instance """
         super().go()
+
+        if self.get('list-local-images'):
+            self._print_local_images()
+            # Clean up the run workdir and exit
+            if self.step.plan.my_run:
+                self.step.plan.my_run._workdir_cleanup()
+            raise SystemExit(0)
 
         # Give info about provided data
         data = TestcloudGuestData(**{
@@ -654,6 +666,13 @@ class ProvisionTestcloud(tmt.steps.provision.ProvisionPlugin):
     def guest(self) -> Optional[tmt.Guest]:
         """ Return the provisioned guest """
         return self._guest
+
+    def _print_local_images(self) -> None:
+        """ Print images which are already cached """
+        self.info("Locally available images")
+        for filename in sorted(TESTCLOUD_IMAGES.glob('*.qcow2')):
+            self.info(filename.name, shift=1, color='yellow')
+            click.echo(f"{TESTCLOUD_IMAGES / filename}")
 
     @classmethod
     def clean_images(cls, clean: 'tmt.base.Clean', dry: bool) -> bool:

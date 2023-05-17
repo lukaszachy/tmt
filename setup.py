@@ -33,6 +33,7 @@ __pkgdir__: Dict[str, str] = {}
 __pkgs__ = [
     'tmt',
     'tmt/export',
+    'tmt/libraries',
     'tmt/plugins',
     'tmt/steps',
     'tmt/steps/discover',
@@ -54,6 +55,7 @@ install_requires = [
     'urllib3',
     'ruamel.yaml',
     'jinja2',
+    'setuptools',
     ]
 
 # typing_extensions is needed with Python 3.7 and older, types imported

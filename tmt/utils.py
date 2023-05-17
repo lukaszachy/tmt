@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import unicodedata
@@ -36,6 +37,7 @@ import jsonschema
 import pkg_resources
 import requests
 import requests.adapters
+import urllib3
 import urllib3.exceptions
 import urllib3.util.retry
 from click import echo, style, wrap_text
@@ -673,12 +675,32 @@ class Common(_CommonBase):
     Provides the run() method for easy command execution.
     """
 
-    # Command line context, options and workdir
-    _context: Optional['tmt.cli.Context'] = None
+    # CLI context and options it carries are saved for later use. This happens
+    # when Click subcommand (or "group" command) runs, and saves its context
+    # in a class corresponding to the subcommand/group. For example, in command
+    # like `tmt run report -h foo --bar=baz`, `report` subcommand would save
+    # its context inside `tmt.steps.report.Report` class.
+    #
+    # The context can be also saved on the instance level, for more fine-grained
+    # context tracking.
+    #
+    # The "later use" means the context is often used when looking for options
+    # like --how, --dry or --verbose.
+    #
+    # TODO: Unfortunately, there's just a single "slot", and there can be only
+    # one saved context on class level. This prevents repeated use of
+    # subcommands, i.e. create multiple phases of a step via CLI. While it's
+    # perfectly fine to define multiple report plugins in plan's fmf data,
+    # doing so via CLI - `report -h display report -h html` - is not supported.
+    _cli_context: Optional['tmt.cli.Context'] = None
+    # FIXME: The class inheritance sets the same instance of _cli_options
+    # dictionary to all child class and causes error in certain cases.
+    _cli_options: Dict[str, Any] = {}
+
     # When set to true, _opt will be ignored (default will be returned)
     ignore_class_options: bool = False
-    _options: Dict[str, Any] = dict()
     _workdir: WorkdirType = None
+    _clone_dirpath: Optional[Path] = None
 
     # TODO: must be declared outside of __init__(), because it must exist before
     # __init__() gets called to allow logging helpers work correctly when used
@@ -703,7 +725,7 @@ class Common(_CommonBase):
             parent: Optional[CommonDerivedType] = None,
             name: Optional[str] = None,
             workdir: WorkdirArgumentType = None,
-            context: Optional['tmt.cli.Context'] = None,
+            cli_context: Optional['tmt.cli.Context'] = None,
             relative_indent: int = 1,
             logger: tmt.log.Logger,
             **kwargs: Any) -> None:
@@ -720,7 +742,7 @@ class Common(_CommonBase):
             parent=parent,
             name=name,
             workdir=workdir,
-            context=context,
+            cli_context=cli_context,
             relative_indent=relative_indent,
             logger=logger,
             **kwargs)
@@ -730,8 +752,8 @@ class Common(_CommonBase):
         self.parent = parent
 
         # Store command line context
-        if context:
-            self._save_context_to_instance(context)
+        if cli_context:
+            self._save_cli_context_to_instance(cli_context)
 
             # TODO: not needed here, apparently, it's applied elsewhere, not to
             # each and every Common child.
@@ -755,15 +777,77 @@ class Common(_CommonBase):
         return self.name
 
     @classmethod
-    def _save_context(cls, context: 'tmt.cli.Context') -> None:
-        """ Save provided command line context and options for future use """
-        cls._context = context
-        cls._options = context.params
+    def _save_cli_context(cls, context: 'tmt.cli.Context') -> None:
+        """
+        Save a CLI context and options it carries for later use.
 
-    def _save_context_to_instance(self, context: 'tmt.cli.Context') -> None:
-        """ Save provided command line context and options to the instance """
-        self._context = context
-        self._options = context.params
+        .. warning::
+
+           The given context is saved into a class variable, therefore it will
+           function as a "default" context for instances on which
+           :py:meth:`_save_cli_context_to_instance` has not been called.
+
+        .. warning::
+
+           The given context will overwrite any previously saved context.
+
+        :param context: CLI context to save.
+        """
+
+        cls._cli_context = context
+        cls._cli_options = cls._cli_context.params
+
+    def _save_cli_context_to_instance(self, context: 'tmt.cli.Context') -> None:
+        """
+        Save a CLI context and options it carries for later use.
+
+        .. warning::
+
+           The given context will overwrite any previously saved context.
+
+        :param context: CLI context to save.
+        """
+
+        self._cli_context = context
+        self._cli_options = self._cli_context.params
+
+    @property
+    def _cli_context_object(self) -> Optional['tmt.cli.ContextObject']:
+        """
+        A CLI context object with tmt info relevant for command execution.
+
+        :returns: CLI context object, or ``None`` if the CLI context itself
+            has not been set.
+        """
+
+        # TODO: can this even happen? Common._save_cli_context() is called
+        # from tmt.cli:main(), would this act as an initializer for all
+        # derived classes?
+        if self._cli_context is None:
+            return None
+
+        return self._cli_context.obj
+
+    @property
+    def _cli_fmf_context(self) -> FmfContextType:
+        """ An fmf context set for this object via CLI """
+
+        # TODO: can this even happen? Common._save_cli_context() is called
+        # from tmt.cli:main(), would this act as an initializer for all
+        # derived classes?
+        if self._cli_context_object is None:
+            return {}
+
+        return self._cli_context_object.fmf_context
+
+    @property
+    def _fmf_context(self) -> FmfContextType:
+        """ An fmf context set for this object. """
+
+        # By default, the only fmf context available is one provided via CLI.
+        # But some derived classes can and will override this, because fmf
+        # context can exist in fmf nodes, too.
+        return self._cli_fmf_context
 
     @overload
     @classmethod
@@ -780,21 +864,7 @@ class Common(_CommonBase):
         """ Get an option from the command line context (class version) """
         if cls.ignore_class_options:
             return default
-        return cls._options.get(option, default)
-
-    @property
-    def _context_object(self) -> Optional['tmt.cli.ContextObject']:
-        if self._context is None:
-            return None
-
-        return self._context.obj
-
-    def _fmf_context(self) -> FmfContextType:
-        """ Return the current fmf context """
-        if self._context_object is None:
-            return dict()
-
-        return self._context_object.fmf_context
+        return cls._cli_options.get(option, default)
 
     def opt(self, option: str, default: Optional[Any] = None) -> Any:
         """
@@ -826,7 +896,7 @@ class Common(_CommonBase):
                 pass
 
         # Get local option
-        local = self._options.get(option, default)
+        local = self._cli_options.get(option, default)
         # Check parent option
         parent = None
         if self.parent:
@@ -1135,6 +1205,20 @@ class Common(_CommonBase):
 
         return self._workdir
 
+    @property
+    def clone_dirpath(self) -> Path:
+        """
+        Path for cloning into
+
+        Used internally for picking specific libraries (or anything
+        else) from cloned repos for filtering purposes, it is removed at
+        the end of relevant step.
+        """
+        if not self._clone_dirpath:
+            self._clone_dirpath = Path(tempfile.TemporaryDirectory(dir=self.workdir).name)
+
+        return self._clone_dirpath
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Exceptions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1419,6 +1503,7 @@ def copytree(
     if rsync_dst[-1] == '/':
         rsync_dst = rsync_dst[:-1]
 
+    dst.mkdir(parents=True, exist_ok=dirs_exist_ok)
     command = ["rsync", "-r"]
     if symlinks:
         command.append('-l')
@@ -1435,6 +1520,42 @@ def copytree(
             [f"Unable to copy '{src}' into '{dst}' using rsync.",
              outcome.returncode, outcome.stdout])
     return dst
+
+
+def get_full_metadata(fmf_tree_path: str, node_path: str) -> Any:
+    """
+    Get full metadata for a node in any fmf tree
+
+    Go through fmf tree nodes using given relative node path
+    and return full data as dictionary.
+    """
+    return fmf.Tree(fmf_tree_path).find(node_path).data
+
+
+def filter_paths(directory: Path, searching: List[str], files_only: bool = False) -> List[Path]:
+    """
+    Filter files for specific paths we are searching for inside a directory
+
+    Returns list of matching paths.
+    """
+    all_paths = list(directory.rglob('*'))  # get all filepaths for given dir recursively
+    alldirs = [str(dir) for dir in all_paths if dir.is_dir()]
+    allfiles = [str(file) for file in all_paths if not file.is_dir()]
+    found_paths: List[str] = []
+
+    for search_string in searching:
+        regex = re.compile(search_string)
+
+        if not files_only:
+            # Search in directories first to reduce amount of copying later
+            matches = list(filter(regex.search, alldirs))
+            if matches:
+                found_paths += matches
+                continue
+
+        # Search through all files
+        found_paths += list(filter(regex.search, allfiles))
+    return [Path(path) for path in set(found_paths)]  # return all matching unique paths as Path's
 
 
 # These two are helpers for shell_to_dict and environment_to_dict -
@@ -1734,8 +1855,14 @@ def dict_to_yaml(
     yaml.encoding = 'utf-8'
     # ignore[assignment]: ruamel bug workaround, see stackoverflow.com/questions/58083562,
     # sourceforge.net/p/ruamel-yaml/tickets/322/
-    yaml.width = width  # type: ignore[assignment]
-    yaml.explicit_start = start  # type: ignore[assignment]
+    #
+    # Yeah, but sometimes the ignore is not needed, at least mypy in a Github
+    # check tells us it's unused... When disabled, the local pre-commit fails.
+    # It seems we cannot win until ruamel.yaml gets its things fixed, therefore,
+    # giving up, and using `cast()` to enforce matching types to silence mypy,
+    # being fully aware the enforce types are wrong.
+    yaml.width = cast(None, width)  # # type: ignore[assignment]
+    yaml.explicit_start = cast(None, start)  # # type: ignore[assignment]
 
     # For simpler dumping of well-known classes
     def _represent_path(representer: Representer, data: Path) -> Any:
@@ -2153,7 +2280,8 @@ class SerializableContainer(DataContainer):
     # silence mypy about the missing actual type.
     @staticmethod
     def unserialize(
-            serialized: Dict[str, Any]
+            serialized: Dict[str, Any],
+            logger: tmt.log.Logger
             ) -> SerializableContainerDerivedType:  # type: ignore[misc,type-var]
         """
         Convert from a serialized form loaded from a file.
@@ -2183,7 +2311,10 @@ class SerializableContainer(DataContainer):
                 "Use 'tmt clean runs' to clean up old runs.")
 
         klass_info = serialized.pop('__class__')
-        klass = import_member(klass_info['module'], klass_info['name'])
+        klass = import_member(
+            module_name=klass_info['module'],
+            member_name=klass_info['name'],
+            logger=logger)
 
         # Stay away from classes that are not derived from this one, to
         # honor promise given by return value annotation.
@@ -2450,6 +2581,15 @@ def public_git_url(url: str) -> str:
     authentication. For now just cover the most common services.
     """
 
+    # Gitlab on private namepace is synced to pkgs.devel.redhat.com
+    # old: https://gitlab.com/redhat/rhel/tests/bash
+    # old: git@gitlab.com:redhat/rhel/tests/bash
+    # new: git://pkgs.devel.redhat.com/tests/bash
+    matched = re.match(r'(?:git@|https://)gitlab.com[:/]redhat/rhel(/.+)', url)
+    if matched:
+        project = matched.group(1)
+        return f'git://pkgs.devel.redhat.com{project}'
+
     # GitHub, GitLab
     # old: git@github.com:teemtee/tmt.git
     # new: https://github.com/teemtee/tmt.git
@@ -2634,17 +2774,25 @@ class retry_session(contextlib.AbstractContextManager):  # type: ignore[type-arg
             status_forcelist: Optional[Tuple[int, ...]] = None,
             timeout: Optional[int] = None
             ) -> requests.Session:
-        retry_strategy = RetryStrategy(
-            total=retries,
-            status_forcelist=status_forcelist,
-            # `method_whitelist`` has been renamed to `allowed_methods` since
-            # urllib3 1.26, and it will be removed in urllib3 2.0.
-            # `allowed_methods` is therefore the future-proof name, but for the
-            # sake of backward compatibility, internally we need to use the
-            # deprecated parameter for now. Or request newer urllib3, but that
-            # might a problem because of RPM availability.
-            method_whitelist=allowed_methods,
-            backoff_factor=backoff_factor)
+
+        # `method_whitelist`` has been renamed to `allowed_methods` since
+        # urllib3 1.26, and it will be removed in urllib3 2.0.
+        # `allowed_methods` is therefore the future-proof name, but for the
+        # sake of backward compatibility, internally might need to use the
+        # deprecated parameter.
+        if urllib3.__version__.startswith('1.'):
+            retry_strategy = RetryStrategy(
+                total=retries,
+                status_forcelist=status_forcelist,
+                method_whitelist=allowed_methods,
+                backoff_factor=backoff_factor)
+
+        else:
+            retry_strategy = RetryStrategy(
+                total=retries,
+                status_forcelist=status_forcelist,
+                allowed_methods=allowed_methods,
+                backoff_factor=backoff_factor)
 
         if timeout is not None:
             http_adapter: requests.adapters.HTTPAdapter = TimeoutHTTPAdapter(
@@ -3700,7 +3848,7 @@ def load_schema_store() -> SchemaStore:
     return store
 
 
-def _prenormalize_fmf_node(node: fmf.Tree, schema_name: str) -> fmf.Tree:
+def _prenormalize_fmf_node(node: fmf.Tree, schema_name: str, logger: tmt.log.Logger) -> fmf.Tree:
     """
     Apply the minimal possible normalization steps to nodes before validating them with schemas.
 
@@ -3766,7 +3914,10 @@ def _prenormalize_fmf_node(node: fmf.Tree, schema_name: str) -> fmf.Tree:
         step_module_name = f'tmt.steps.{step_name}'
         step_class_name = step_name.capitalize()
 
-        step_class = import_member(step_module_name, step_class_name)
+        step_class = import_member(
+            module_name=step_module_name,
+            member_name=step_class_name,
+            logger=logger)
 
         if not issubclass(step_class, tmt.steps.Step):
             raise GeneralError(
@@ -3808,10 +3959,12 @@ def _prenormalize_fmf_node(node: fmf.Tree, schema_name: str) -> fmf.Tree:
 
 
 def validate_fmf_node(
-        node: fmf.Tree, schema_name: str) -> List[Tuple[jsonschema.ValidationError, str]]:
+        node: fmf.Tree,
+        schema_name: str,
+        logger: tmt.log.Logger) -> List[Tuple[jsonschema.ValidationError, str]]:
     """ Validate a given fmf node """
 
-    node = _prenormalize_fmf_node(node, schema_name)
+    node = _prenormalize_fmf_node(node, schema_name, logger)
 
     result = node.validate(load_schema(Path(schema_name)), schema_store=load_schema_store())
 
@@ -3953,7 +4106,7 @@ class ValidateFmfMixin(_CommonBase):
         """ Validate a given fmf node """
 
         errors = validate_fmf_node(
-            node, f'{self.__class__.__name__.lower()}.yaml')
+            node, f'{self.__class__.__name__.lower()}.yaml', logger)
 
         if errors:
             if raise_on_validation_error:
@@ -4407,6 +4560,12 @@ class LoadFmfKeysMixin(NormalizeKeysMixin):
 FieldCLIOption = Union[str, Sequence[str]]
 
 
+class Deprecated(NamedTuple):
+    """ Version information and hint for obsolete options """
+    since: str
+    hint: Optional[str] = None
+
+
 @overload
 def field(
         *,
@@ -4417,6 +4576,7 @@ def field(
         choices: Union[None, Sequence[str], Callable[[], Sequence[str]]] = None,
         multiple: bool = False,
         metavar: Optional[str] = None,
+        deprecated: Optional[Deprecated] = None,
         help: Optional[str] = None,
         # Input data normalization - not needed, the field is a boolean
         # flag.
@@ -4438,6 +4598,7 @@ def field(
         choices: Union[None, Sequence[str], Callable[[], Sequence[str]]] = None,
         multiple: bool = False,
         metavar: Optional[str] = None,
+        deprecated: Optional[Deprecated] = None,
         help: Optional[str] = None,
         # Input data normalization
         normalize: Optional[NormalizeCallback[T]] = None,
@@ -4458,6 +4619,7 @@ def field(
         choices: Union[None, Sequence[str], Callable[[], Sequence[str]]] = None,
         multiple: bool = False,
         metavar: Optional[str] = None,
+        deprecated: Optional[Deprecated] = None,
         help: Optional[str] = None,
         # Input data normalization
         normalize: Optional[NormalizeCallback[T]] = None,
@@ -4478,6 +4640,7 @@ def field(
         choices: Union[None, Sequence[str], Callable[[], Sequence[str]]] = None,
         multiple: bool = False,
         metavar: Optional[str] = None,
+        deprecated: Optional[Deprecated] = None,
         help: Optional[str] = None,
         # Input data normalization
         normalize: Optional[NormalizeCallback[T]] = None,
@@ -4505,8 +4668,14 @@ def field(
     :param choices: if provided, the command-line option would accept only
         the listed input values.
         Passed to :py:func:`click.option` as a :py:class:`click.Choice` instance.
+    :param multiple: accept multiple arguments of the same name.
+        Passed directly to :py:func:`click.option`.
     :param metavar: how the input value is represented in the help page.
         Passed directly to :py:func:`click.option`.
+    :param deprecated: mark the option as deprecated
+        Provide an instance of Deprecated() with version in which the
+        option was obsoleted and an optional hint with the recommended
+        alternative. A warning message will be added to the option help.
     :param help: the help string for the command-line option. Multiline strings
         can be used, :py:func:`textwrap.dedent` is applied before passing
         ``help`` to :py:func:`click.option`.
@@ -4528,6 +4697,16 @@ def field(
 
         if help:
             help = textwrap.dedent(help)
+
+        # Add a deprecation warning for obsoleted options
+        if deprecated:
+            warning = f"The option is deprecated since {deprecated.since}."
+            if not help:
+                help = warning
+            else:
+                help += " " + warning
+            if deprecated.hint:
+                help += " " + deprecated.hint
 
         metadata.option_args = (option,) if isinstance(option, str) else option
         metadata.option_kwargs = {

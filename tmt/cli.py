@@ -6,7 +6,8 @@ import collections
 import dataclasses
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, DefaultDict, List, Optional, Set
+from typing import (TYPE_CHECKING, Any, DefaultDict, List, Optional, Set,
+                    Tuple, Type, Union)
 
 import click
 import fmf
@@ -18,6 +19,7 @@ import tmt.base
 import tmt.convert
 import tmt.export
 import tmt.identifier
+import tmt.lint
 import tmt.log
 import tmt.options
 import tmt.plugins
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
     import tmt.steps.execute
 
 # Explore available plugins (need to detect all supported methods first)
-tmt.plugins.explore()
+tmt.plugins.explore(tmt.log.Logger.get_bootstrap_logger())
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Click Context Object Container
@@ -134,6 +136,7 @@ filter_options_long = create_options_decorator(tmt.options.FILTER_OPTIONS_LONG)
 fmf_source_options = create_options_decorator(tmt.options.FMF_SOURCE_OPTIONS)
 story_flags_filter_options = create_options_decorator(tmt.options.STORY_FLAGS_FILTER_OPTIONS)
 remote_plan_options = create_options_decorator(tmt.options.REMOTE_PLAN_OPTIONS)
+lint_options = create_options_decorator(tmt.options.LINT_OPTIONS)
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -183,7 +186,7 @@ def main(
     click_contex.color = apply_colors_output
 
     # Save click context and fmf context for future use
-    tmt.utils.Common._save_context(click_contex)
+    tmt.utils.Common._save_cli_context(click_contex)
 
     # Initialize metadata tree (from given path or current directory)
     tree = tmt.Tree(logger=logger, path=Path(root))
@@ -263,7 +266,7 @@ def run(context: Context, id_: Optional[str], **kwargs: Any) -> None:
     run = tmt.Run(
         id_=Path(id_) if id_ is not None else None,
         tree=context.obj.tree,
-        context=context,
+        cli_context=context,
         logger=logger
         )
     context.obj.run = run
@@ -306,7 +309,7 @@ def run_plans(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter plans by name.
     Use '.' to select plans under the current working directory.
     """
-    tmt.base.Plan._save_context(context)
+    tmt.base.Plan._save_cli_context(context)
 
 
 @run.command(name='tests')
@@ -332,7 +335,7 @@ def run_tests(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter tests by name.
     Use '.' to select tests under the current working directory.
     """
-    tmt.base.Test._save_context(context)
+    tmt.base.Test._save_cli_context(context)
 
 
 # FIXME: click 8.0 renamed resultcallback to result_callback. The former
@@ -355,6 +358,90 @@ def finito(
     """ Run tests if run defined """
     if isinstance(click_context.obj, ContextObject) and click_context.obj.run:
         click_context.obj.run.go()
+
+
+def _lint_class(
+        context: Context,
+        klass: Union[Type[tmt.base.Test], Type[tmt.base.Plan], Type[tmt.base.Story]],
+        failed_only: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        outcomes: List[tmt.lint.LinterOutcome],
+        **kwargs: Any) -> int:
+    """ Lint a single class of objects """
+
+    # FIXME: Workaround https://github.com/pallets/click/pull/1840 for click 7
+    context.params.update(**kwargs)
+    klass._save_cli_context(context)
+
+    exit_code = 0
+
+    for lintable in klass.from_tree(context.obj.tree):
+        valid, rulings = lintable.lint(
+            enable_checks=enable_checks or None,
+            disable_checks=disable_checks or None,
+            enforce_checks=enforce_checks or None)
+
+        # If the object pass the checks, and we're asked to show only the failed
+        # ones, display nothing.
+        if valid and failed_only:
+            continue
+
+        # Find out what rulings were allowed by user. By default, it's all, but
+        # user might be interested in "warn" only, for example. Reduce the list
+        # of rulings, and if we end up with an empty list *and* user constrained
+        # us to just a subset of rulings, display nothing.
+        allowed_rulings = list(tmt.lint.filter_allowed_checks(rulings, outcomes=outcomes))
+
+        if not allowed_rulings and outcomes:
+            continue
+
+        lintable.ls()
+
+        echo('\n'.join(tmt.lint.format_rulings(allowed_rulings)))
+
+        if not valid:
+            exit_code = 1
+
+        echo()
+
+    return exit_code
+
+
+def do_lint(
+        context: Context,
+        klasses: List[Union[Type[tmt.base.Test], Type[tmt.base.Plan], Type[tmt.base.Story]]],
+        list_checks: bool,
+        failed_only: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        outcomes: List[tmt.lint.LinterOutcome],
+        **kwargs: Any) -> int:
+    """ Core of all ``lint`` commands """
+
+    if list_checks:
+        for klass in klasses:
+            klass_label = 'stories' if klass is tmt.base.Story else f'{klass.__name__.lower()}s'
+            echo(f'Linters available for {klass_label}')
+            echo(klass.format_linters())
+            echo()
+
+        return 0
+
+    return max(
+        _lint_class(
+            context,
+            klass,
+            failed_only,
+            enable_checks,
+            disable_checks,
+            enforce_checks,
+            outcomes,
+            **kwargs)
+        for klass in klasses
+        )
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -388,7 +475,7 @@ def tests_ls(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter tests by name.
     Use '.' to select tests under the current working directory.
     """
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
     for test in context.obj.tree.tests():
         test.ls()
 
@@ -404,7 +491,7 @@ def tests_show(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter tests by name.
     Use '.' to select tests under the current working directory.
     """
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
     for test in context.obj.tree.tests():
         test.show()
         echo()
@@ -414,23 +501,36 @@ def tests_show(context: Context, **kwargs: Any) -> None:
 @click.pass_context
 @filter_options
 @fmf_source_options
+@lint_options
 @fix_options
 @verbosity_options
-def tests_lint(context: Context, **kwargs: Any) -> None:
+def tests_lint(
+        context: Context,
+        list_checks: bool,
+        failed_only: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        outcome_only: Tuple[str, ...],
+        **kwargs: Any) -> None:
     """
     Check tests against the L1 metadata specification.
 
     Regular expression can be used to filter tests for linting.
     Use '.' to select tests under the current working directory.
     """
-    # FIXME: Workaround https://github.com/pallets/click/pull/1840 for click 7
-    context.params.update(**kwargs)
-    tmt.Test._save_context(context)
-    exit_code = 0
-    for test in context.obj.tree.tests():
-        if not test.lint():
-            exit_code = 1
-        echo()
+
+    exit_code = do_lint(
+        context,
+        [tmt.base.Test],
+        list_checks,
+        failed_only,
+        enable_checks,
+        disable_checks,
+        enforce_checks,
+        [tmt.lint.LinterOutcome(outcome) for outcome in outcome_only],
+        **kwargs)
+
     raise SystemExit(exit_code)
 
 
@@ -459,7 +559,7 @@ def tests_create(
     current working directory.
     """
     assert context.obj.tree.root is not None  # narrow type
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
     tmt.Test.create(name, template, context.obj.tree.root, force)
 
 
@@ -545,7 +645,7 @@ def tests_import(
     nitrate ...... contact, component, tag, environment, relevancy, enabled
     polarion ..... summary, enabled, assignee, id, component, tag, description, link
     """
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
 
     if manual:
         if not (case or plan):
@@ -615,6 +715,11 @@ _test_export_default = 'yaml'
     help="Ignore unpublished git changes and export to Nitrate. "
     "The case might not be able to be scheduled!")
 @click.option(
+    '--append-summary / --no-append-summary', default=False,
+    help="Include test summary in the Nitrate/Polarion test case summary as well. "
+    "By default, only the repository name and test name are used."
+    )
+@click.option(
     '--create', is_flag=True,
     help="Create test cases in nitrate if they don't exist.")
 @click.option(
@@ -657,7 +762,7 @@ def tests_export(
     Regular expression can be used to filter tests by name.
     Use '.' to select tests under the current working directory.
     """
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
 
     if nitrate:
         context.obj.common.warn(
@@ -703,7 +808,7 @@ def tests_id(context: Context, **kwargs: Any) -> None:
     filter and the value is stored to disk. Existing identifiers
     are kept intact.
     """
-    tmt.Test._save_context(context)
+    tmt.Test._save_cli_context(context)
     for test in context.obj.tree.tests():
         tmt.identifier.id_command(test.node, "test", dry=kwargs["dry"])
 
@@ -724,7 +829,7 @@ def plans(context: Context, **kwargs: Any) -> None:
     Search for available plans.
     Explore detailed test step configuration.
     """
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
 
     # Show overview of available plans
     if context.invoked_subcommand is None:
@@ -743,7 +848,7 @@ def plans_ls(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter plans by name.
     Use '.' to select plans under the current working directory.
     """
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
     for plan in context.obj.tree.plans():
         plan.ls()
 
@@ -760,7 +865,7 @@ def plans_show(context: Context, **kwargs: Any) -> None:
     Regular expression can be used to filter plans by name.
     Use '.' to select plans under the current working directory.
     """
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
     for plan in context.obj.tree.plans():
         plan.show()
         echo()
@@ -770,22 +875,36 @@ def plans_show(context: Context, **kwargs: Any) -> None:
 @click.pass_context
 @filter_options
 @fmf_source_options
+@lint_options
+@fix_options
 @verbosity_options
-def plans_lint(context: Context, **kwargs: Any) -> None:
+def plans_lint(
+        context: Context,
+        list_checks: bool,
+        failed_only: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        outcome_only: Tuple[str, ...],
+        **kwargs: Any) -> None:
     """
     Check plans against the L2 metadata specification.
 
     Regular expression can be used to filter plans by name.
     Use '.' to select plans under the current working directory.
     """
-    # FIXME: Workaround https://github.com/pallets/click/pull/1840 for click 7
-    context.params.update(**kwargs)
-    tmt.Plan._save_context(context)
-    exit_code = 0
-    for plan in context.obj.tree.plans():
-        if not plan.lint():
-            exit_code = 1
-        echo()
+
+    exit_code = do_lint(
+        context,
+        [tmt.base.Plan],
+        list_checks,
+        failed_only,
+        enable_checks,
+        disable_checks,
+        enforce_checks,
+        [tmt.lint.LinterOutcome(outcome) for outcome in outcome_only],
+        **kwargs)
+
     raise SystemExit(exit_code)
 
 
@@ -827,7 +946,7 @@ def plans_create(
         **kwargs: Any) -> None:
     """ Create a new plan based on given template. """
     assert context.obj.tree.root is not None  # narrow type
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
     tmt.Plan.create(name, template, context.obj.tree.root, force)
 
 
@@ -866,7 +985,7 @@ def plans_export(
     Regular expression can be used to filter plans by name.
     Use '.' to select plans under the current working directory.
     """
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
 
     if format != _test_export_default:
         context.obj.common.warn("Option '--format' is deprecated, please use '--how' instead.")
@@ -893,7 +1012,7 @@ def plans_id(context: Context, **kwargs: Any) -> None:
     filter and the value is stored to disk. Existing identifiers
     are kept intact.
     """
-    tmt.Plan._save_context(context)
+    tmt.Plan._save_cli_context(context)
     for plan in context.obj.tree.plans():
         tmt.identifier.id_command(plan.node, "plan", dry=kwargs["dry"])
 
@@ -913,7 +1032,7 @@ def stories(context: Context, **kwargs: Any) -> None:
     Check available user stories.
     Explore coverage (test, implementation, documentation).
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
 
     # Show overview of available stories
     if context.invoked_subcommand is None:
@@ -942,7 +1061,7 @@ def stories_ls(
     Regular expression can be used to filter stories by name.
     Use '.' to select stories under the current working directory.
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
     for story in context.obj.tree.stories():
         if story._match(implemented, verified, documented, covered,
                         unimplemented, unverified, undocumented, uncovered):
@@ -971,7 +1090,7 @@ def stories_show(
     Regular expression can be used to filter stories by name.
     Use '.' to select stories under the current working directory.
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
     for story in context.obj.tree.stories():
         if story._match(implemented, verified, documented, covered,
                         unimplemented, unverified, undocumented, uncovered):
@@ -999,7 +1118,7 @@ def stories_create(
         **kwargs: Any) -> None:
     """ Create a new story based on given template. """
     assert context.obj.tree.root is not None  # narrow type
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
     tmt.Story.create(name, template, context.obj.tree.root, force)
 
 
@@ -1034,7 +1153,7 @@ def stories_coverage(
     Regular expression can be used to filter stories by name.
     Use '.' to select stories under the current working directory.
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
 
     def headfoot(text: str) -> None:
         """ Format simple header/footer """
@@ -1124,7 +1243,7 @@ def stories_export(
     Regular expression can be used to filter stories by name.
     Use '.' to select stories under the current working directory.
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
 
     if format != _test_export_default:
         context.obj.common.warn("Option '--format' is deprecated, please use '--how' instead.")
@@ -1147,22 +1266,36 @@ def stories_export(
 @click.pass_context
 @filter_options
 @fmf_source_options
+@lint_options
+@fix_options
 @verbosity_options
-def stories_lint(context: Context, **kwargs: Any) -> None:
+def stories_lint(
+        context: Context,
+        list_checks: bool,
+        failed_only: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        outcome_only: Tuple[str, ...],
+        **kwargs: Any) -> None:
     """
     Check stories against the L3 metadata specification.
 
     Regular expression can be used to filter stories by name.
     Use '.' to select stories under the current working directory.
     """
-    # FIXME: Workaround https://github.com/pallets/click/pull/1840 for click 7
-    context.params.update(**kwargs)
-    tmt.Story._save_context(context)
-    exit_code = 0
-    for story in context.obj.tree.stories():
-        if not story.lint():
-            exit_code = 1
-        echo()
+
+    exit_code = do_lint(
+        context,
+        [tmt.base.Story],
+        list_checks,
+        failed_only,
+        enable_checks,
+        disable_checks,
+        enforce_checks,
+        [tmt.lint.LinterOutcome(outcome) for outcome in outcome_only],
+        **kwargs)
+
     raise SystemExit(exit_code)
 
 
@@ -1190,7 +1323,7 @@ def stories_id(
     filter and the value is stored to disk. Existing identifiers
     are kept intact.
     """
-    tmt.Story._save_context(context)
+    tmt.Story._save_cli_context(context)
     for story in context.obj.tree.stories():
         if story._match(implemented, verified, documented, covered,
                         unimplemented, unverified, undocumented, uncovered):
@@ -1230,7 +1363,7 @@ def init(
     * 'full' template contains a 'full' story, an 'full' plan and a shell test.
     """
 
-    tmt.Tree._save_context(context)
+    tmt.Tree._save_cli_context(context)
     tmt.Tree.init(logger=context.obj.logger, path=Path(path), template=template, force=force)
 
 
@@ -1282,7 +1415,7 @@ def status(
             "used together.")
     if not Path(workdir_root).exists():
         raise tmt.utils.GeneralError(f"Path '{workdir_root}' doesn't exist.")
-    status_obj = tmt.Status(logger=context.obj.logger, context=context)
+    status_obj = tmt.Status(logger=context.obj.logger, cli_context=context)
     status_obj.show()
 
 
@@ -1317,7 +1450,7 @@ def clean(context: Context, **kwargs: Any) -> None:
     clean_obj = tmt.Clean(
         logger=context.obj.clean_logger,
         parent=context.obj.common,
-        context=context
+        cli_context=context
         )
     context.obj.clean = clean_obj
     exit_code = 0
@@ -1333,7 +1466,7 @@ def clean(context: Context, **kwargs: Any) -> None:
             .descend(logger_name='clean-images', extra_shift=0)
             .apply_verbosity_options(**kwargs),
             parent=clean_obj,
-            context=context
+            cli_context=context
             )
         if tmt.utils.WORKDIR_ROOT.exists():
             if not clean_obj.guests():
@@ -1417,7 +1550,7 @@ def clean_runs(
         .descend(logger_name='clean-runs', extra_shift=0)
         .apply_verbosity_options(**kwargs),
         parent=context.obj.clean,
-        context=context)
+        cli_context=context)
     context.obj.clean_partials["runs"].append(clean_obj.runs)
 
 
@@ -1458,7 +1591,7 @@ def clean_guests(
         .descend(logger_name='clean-guests', extra_shift=0)
         .apply_verbosity_options(**kwargs),
         parent=context.obj.clean,
-        context=context
+        cli_context=context
         )
     context.obj.clean_partials["guests"].append(clean_obj.guests)
 
@@ -1484,7 +1617,7 @@ def clean_images(context: Context, **kwargs: Any) -> None:
         .descend(logger_name='clean-images', extra_shift=0)
         .apply_verbosity_options(**kwargs),
         parent=context.obj.clean,
-        context=context
+        cli_context=context
         )
     context.obj.clean_partials["images"].append(clean_obj.images)
 
@@ -1497,9 +1630,18 @@ def clean_images(context: Context, **kwargs: Any) -> None:
 @click.pass_context
 @filter_options
 @fmf_source_options
+@lint_options
 @fix_options
 @verbosity_options
-def lint(context: Context, **kwargs: Any) -> None:
+def lint(
+        context: Context,
+        list_checks: bool,
+        enable_checks: List[str],
+        disable_checks: List[str],
+        enforce_checks: List[str],
+        failed_only: bool,
+        outcome_only: Tuple[str, ...],
+        **kwargs: Any) -> None:
     """
     Check all the present metadata against the specification.
 
@@ -1510,20 +1652,19 @@ def lint(context: Context, **kwargs: Any) -> None:
     Use '.' to select tests, plans and stories under the current
     working directory.
     """
-    exit_code = 0
-    for command in (tests_lint, plans_lint, stories_lint):
-        try:
-            context.forward(command)
-        except SystemExit as e:
-            # SystemExit.code is Union[str, int, None], because that's all accepted by
-            # `sys.exit()` (see https://docs.python.org/3.9/library/sys.html#sys.exit).
-            # Our code is sane, returns either zero or another integer, so let's add
-            # a check & raise an error should we run into an unexpected type. It'd mean
-            # subcommands suddenly started returning non-integer exit code, and why would
-            # they do anything like that??
-            if not isinstance(e.code, int):
-                raise tmt.utils.GeneralError(f"Unexpected non-integer exit code '{e.code}'.")
-            exit_code |= e.code
+
+    exit_code = do_lint(
+        context,
+        [tmt.base.Test, tmt.base.Plan, tmt.base.Story],
+        list_checks,
+        failed_only,
+        enable_checks,
+        disable_checks,
+        enforce_checks,
+        [tmt.lint.LinterOutcome(outcome) for outcome in outcome_only],
+        **kwargs
+        )
+
     raise SystemExit(exit_code)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

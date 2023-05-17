@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from datetime import timedelta
 from typing import Any, List, Tuple
 
 import py
@@ -21,8 +22,8 @@ import tmt.utils
 from tmt.utils import (Command, Common, GeneralError, Path, ShellScript,
                        StructuredField, StructuredFieldError,
                        WaitingIncomplete, WaitingTimedOutError, _CommonBase,
-                       duration_to_seconds, listify, public_git_url,
-                       validate_git_status, wait)
+                       duration_to_seconds, filter_paths, listify,
+                       public_git_url, validate_git_status, wait)
 
 run = Common(logger=tmt.log.Logger.create(verbose=0, debug=0, quiet=False)).run
 
@@ -90,6 +91,15 @@ def test_public_git_url():
             }, {
             'original': 'ssh://git@pagure.io/fedora-ci/metadata.git',
             'expected': 'https://pagure.io/fedora-ci/metadata.git',
+            }, {
+            'original': 'git@gitlab.com:redhat/rhel/NAMESPACE/COMPONENT.git',
+            'expected': 'git://pkgs.devel.redhat.com/NAMESPACE/COMPONENT.git',
+            }, {
+            'original': 'https://gitlab.com/redhat/rhel/NAMESPACE/COMPONENT',
+            'expected': 'git://pkgs.devel.redhat.com/NAMESPACE/COMPONENT',
+            }, {
+            'original': 'https://gitlab.com/redhat/centos-stream/NAMESPACE/COMPONENT.git',
+            'expected': 'https://gitlab.com/redhat/centos-stream/NAMESPACE/COMPONENT.git',
             },
         ]
     for example in examples:
@@ -869,24 +879,31 @@ def test_wait_success_but_too_late(root_logger):
         wait(Common(logger=root_logger), check, datetime.timedelta(seconds=1))
 
 
-def test_import_member():
-    klass = tmt.plugins.import_member('tmt.steps.discover', 'Discover')
+def test_import_member(root_logger):
+    klass = tmt.plugins.import_member(
+        module_name='tmt.steps.discover', member_name='Discover', logger=root_logger)
 
     assert klass is tmt.steps.discover.Discover
 
 
-def test_import_member_no_such_module():
+def test_import_member_no_such_module(root_logger):
     with pytest.raises(
             tmt.utils.GeneralError,
             match=r"Failed to import module 'tmt\.steps\.nope_does_not_exist'."):
-        tmt.plugins.import_member('tmt.steps.nope_does_not_exist', 'Discover')
+        tmt.plugins.import_member(
+            module_name='tmt.steps.nope_does_not_exist',
+            member_name='Discover',
+            logger=root_logger)
 
 
-def test_import_member_no_such_class():
+def test_import_member_no_such_class(root_logger):
     with pytest.raises(
             tmt.utils.GeneralError,
             match=r"No such member 'NopeDoesNotExist' in module 'tmt\.steps\.discover'."):
-        tmt.plugins.import_member('tmt.steps.discover', 'NopeDoesNotExist')
+        tmt.plugins.import_member(
+            module_name='tmt.steps.discover',
+            member_name='NopeDoesNotExist',
+            logger=root_logger)
 
 
 def test_common_base_inheritance(root_logger):
@@ -969,3 +986,31 @@ def test_uniq(values: List[Any], expected: List[Any]) -> None:
     )
 def test_flatten(lists: List[List[Any]], unique: bool, expected: List[Any]) -> None:
     assert tmt.utils.flatten(lists, unique=unique) == expected
+
+
+@pytest.mark.parametrize(
+    ('duration', 'expected'),
+    (
+        (timedelta(seconds=8), '00:00:08'),
+        (timedelta(minutes=6, seconds=8), '00:06:08'),
+        (timedelta(hours=4, minutes=6, seconds=8), '04:06:08'),
+        (timedelta(days=15, hours=4, minutes=6, seconds=8), '364:06:08'),
+        )
+    )
+def test_format_duration(duration, expected):
+    from tmt.steps.execute import ExecutePlugin
+
+    assert ExecutePlugin.format_duration(duration) == expected
+
+
+def test_filter_paths(source_dir):
+    """ Test if path filtering works correctly """
+    paths = filter_paths(source_dir, ['/library'])
+    assert len(paths) == 1
+    assert paths[0] == source_dir / 'library'
+
+    paths = filter_paths(source_dir, ['bz[235]'])
+    assert len(paths) == 3
+
+    paths = filter_paths(source_dir, ['bz[235]', '/tests/bz5'])
+    assert len(paths) == 3

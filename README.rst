@@ -404,6 +404,10 @@ TMT_TEST_DATA
     back from the guest and available for inspection after the
     test execution is finished.
 
+TMT_TEST_SERIAL_NUMBER
+    The serial number of running test in the whole plan. Each test
+    is assigned its own serial number.
+
 TMT_TEST_METADATA
     Path to a YAML-formatted file with test metadata collected
     during the ``discover`` step.
@@ -424,6 +428,25 @@ TMT_REBOOT_COUNT
     for requesting the reboot, variables ``REBOOTCOUNT`` and
     ``RSTRNT_REBOOTCOUNT`` contain number of reboots as well.
 
+TMT_GUEST_HOSTNAME, TMT_GUEST_ROLE
+    The hostname of the guest on which the test is running, and
+    the multihost role of the guest, if it was specified in plan's
+    ``provision`` step, via ``role`` key.
+
+TMT_ROLE_*
+    Space-separated list of guests of a given role. Each known role
+    spawns a variable, listing the corresponding guests. For example,
+    for guests with ``role: foo``, ``TMT_ROLE_foo=guest1 guest2 ...``
+    variable would be available to tests.
+
+SERVERS
+    A legacy variable, exported for the backward compatibility. It
+    contains a list of all guests on which the test is running at
+    the moment.
+
+    This variable will be removed in the future, it is supported only
+    to make multihost prototype support easier to verify as many current
+    tests were developed with Restraint.
 
 Links
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -475,7 +498,8 @@ Cahyna, Martin Litwora, Brian Grech, Vojtěch Eichler, Philip Daly,
 Vector Li, Evgeny Fedin, Guy Inger, Adrián Tomašov, Jan Havlín,
 Lukáš Kotek, Daniel Diblík, Laura Barcziova, Marián Konček,
 Marcin Sobczyk, Jiří Jabůrek, Huijing Hei, Tibor Dudlák, Jan
-Macků, Filip Vágner, Martin Hoyer and Iveta Česalová.
+Macků, Filip Vágner, Martin Hoyer, Iveta Česalová, Yi Zhang
+and Zhaojuan Guo.
 
 
 Copyright

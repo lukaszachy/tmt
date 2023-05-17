@@ -10,19 +10,22 @@ import shutil
 import sys
 import time
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generator,
-                    Iterable, Iterator, List, Optional, Sequence, Tuple,
+                    Iterable, Iterator, List, Optional, Sequence, Tuple, Type,
                     TypeVar, Union, cast)
 
 import fmf
 import fmf.base
 import fmf.utils
+import jsonschema
 from click import confirm, echo, style
 from fmf.utils import listed
 from ruamel.yaml.error import MarkedYAMLError
 
 import tmt.export
 import tmt.identifier
+import tmt.lint
 import tmt.log
+import tmt.plugins
 import tmt.steps
 import tmt.steps.discover
 import tmt.steps.execute
@@ -32,6 +35,7 @@ import tmt.steps.provision
 import tmt.steps.report
 import tmt.templates
 import tmt.utils
+from tmt.lint import LinterOutcome, LinterReturn
 from tmt.result import Result, ResultOutcome
 from tmt.utils import (Command, EnvironmentType, FmfContextType, Path,
                        ShellScript, WorkdirArgumentType, verdict)
@@ -307,14 +311,16 @@ class RequireSimple(str):
 class _RawRequireFmfId(_RawFmfId):
     destination: Optional[str]
     nick: Optional[str]
+    type: Optional[str]
 
 
 @dataclasses.dataclass
 class RequireFmfId(FmfId):
-    VALID_KEYS: ClassVar[List[str]] = FmfId.VALID_KEYS + ['destination', 'nick']
+    VALID_KEYS: ClassVar[List[str]] = FmfId.VALID_KEYS + ['destination', 'nick', 'type']
 
     destination: Optional[Path] = None
     nick: Optional[str] = None
+    type: Optional[str] = None
 
     # ignore[override]: expected, we do want to return more specific
     # type than the one declared in superclass.
@@ -366,7 +372,7 @@ class RequireFmfId(FmfId):
 
         fmf_id = RequireFmfId()
 
-        for key in ('url', 'ref', 'name', 'nick'):
+        for key in ('url', 'ref', 'name', 'nick', 'type'):
             setattr(fmf_id, key, cast(Optional[str], raw.get(key, None)))
 
         for key in ('path', 'destination'):
@@ -376,10 +382,100 @@ class RequireFmfId(FmfId):
         return fmf_id
 
 
-_RawRequireItem = Union[str, _RawRequireFmfId]
+class _RawRequireFile(TypedDict):
+    type: Optional[str]
+    pattern: Optional[List[str]]
+
+
+@dataclasses.dataclass
+class RequireFile(
+        tmt.utils.SpecBasedContainer,
+        tmt.utils.SerializableContainer,
+        tmt.export.Exportable['RequireFile']):
+    VALID_KEYS: ClassVar[List[str]] = ['type', 'pattern']
+
+    type: Optional[str] = None
+    pattern: List[str] = tmt.utils.field(
+        default_factory=list,
+        normalize=tmt.utils.normalize_string_list)
+
+    # ignore[override]: expected, we do want to return more specific
+    # type than the one declared in superclass.
+    def to_dict(self) -> _RawRequireFile:  # type: ignore[override]
+        """ Return keys and values in the form of a dictionary """
+        return cast(_RawRequireFile, super().to_dict())
+
+    # ignore[override]: expected, we do want to return more specific
+    # type than the one declared in superclass.
+    def to_minimal_dict(self) -> _RawRequireFile:  # type: ignore[override]
+        """ Convert to a mapping with unset keys omitted """
+        return cast(_RawRequireFile, super().to_minimal_dict())
+
+    # ignore[override]: expected, we do want to return more specific
+    # type than the one declared in superclass.
+    def to_spec(self) -> _RawRequireFile:  # type: ignore[override]
+        """ Convert to a form suitable for saving in a specification file """
+        return self.to_dict()
+
+    # ignore[override]: expected, we do want to return more specific
+    # type than the one declared in superclass.
+    def to_minimal_spec(self) -> _RawRequireFile:  # type: ignore[override]
+        """ Convert to specification, skip default values """
+        return cast(_RawRequireFile, super().to_minimal_spec())
+
+    # ignore[override]: expected, we do want to accept and return more
+    # specific types than those declared in superclass.
+    @classmethod
+    def from_spec(cls, raw: _RawRequireFile) -> 'RequireFile':
+        """ Convert from a specification file or from a CLI option """
+        require_file = RequireFile()
+
+        require_file.type = raw.get('type', None)
+
+        patterns: List[Optional[str]] = []
+        raw_patterns = raw.get('pattern', [])
+        if not raw_patterns:
+            raise tmt.utils.SpecificationError(f'Missing pattern for file require: {raw}')
+        if isinstance(raw_patterns, str):
+            patterns.append(raw_patterns)
+        else:
+            for pattern in raw_patterns:
+                patterns.append(str(pattern))
+        require_file.pattern = cast(List[str], patterns)
+
+        return require_file
+
+    @staticmethod
+    def validate() -> Tuple[bool, str]:
+        """
+        Validate file requirement and return a human readable error
+
+        There is no way to check validity of type or pattern string at
+        this time. Return a tuple (boolean, message) as the result of
+        validation. The boolean specifies the validation result and the
+        message the validation error. In case the file requirement is
+        valid, return an empty string as the message.
+        """
+        return True, ''
+
+
+_RawRequireItem = Union[str, _RawRequireFmfId, _RawRequireFile]
 _RawRequire = Union[_RawRequireItem, List[_RawRequireItem]]
 
-Require = Union[RequireSimple, RequireFmfId]
+Require = Union[RequireSimple, RequireFmfId, RequireFile]
+
+
+def require_factory(require: Optional[_RawRequireItem]) -> Require:
+    """ Select the correct require class """
+    if isinstance(require, dict):
+        require_type = require.get('type', 'library')
+        if require_type == 'library':  # can't use isinstance check with TypedDict
+            return RequireFmfId.from_spec(require)  # type: ignore[arg-type]
+        if require_type == 'file':
+            return RequireFile.from_spec(require)  # type: ignore[arg-type]
+
+    assert isinstance(require, str)  # check type
+    return RequireSimple.from_spec(require)
 
 
 def normalize_require(raw_require: Optional[_RawRequire], logger: tmt.log.Logger) -> List[Require]:
@@ -395,17 +491,10 @@ def normalize_require(raw_require: Optional[_RawRequire], logger: tmt.log.Logger
     if raw_require is None:
         return []
 
-    if isinstance(raw_require, str):
-        return [RequireSimple.from_spec(raw_require)]
+    if isinstance(raw_require, str) or isinstance(raw_require, dict):
+        return [require_factory(raw_require)]
 
-    if isinstance(raw_require, dict):
-        return [RequireFmfId.from_spec(raw_require)]
-
-    return [
-        RequireSimple.from_spec(require)
-        if isinstance(require, str) else RequireFmfId.from_spec(require)
-        for require in raw_require
-        ]
+    return [require_factory(require) for require in raw_require]
 
 
 def assert_simple_requirements(
@@ -538,6 +627,20 @@ class Core(
         """ Node name """
         return self.name
 
+    @classmethod
+    def from_tree(cls: Type[T], tree: 'tmt.Tree') -> List[T]:
+        """
+        Gather list of instances of this class in a given tree.
+
+        Helpful when looking for objects of a class derived from :py:class:`Core`
+        in a given tree, encapsulating the mapping between core classes and tree
+        search methods.
+
+        :param tree: tree to search for objects.
+        """
+
+        return cast(List[T], getattr(tree, f'{cls.__name__.lower()}s')())
+
     def _update_metadata(self) -> None:
         """ Update the _metadata attribute """
         self._metadata.update(self._export())
@@ -592,9 +695,9 @@ class Core(
         return tmt.utils.web_git_url(fmf_id.url, fmf_id.ref, relative_path)
 
     @classmethod
-    def _save_context(cls, context: 'tmt.cli.Context') -> None:
+    def _save_cli_context(cls, context: 'tmt.cli.Context') -> None:
         """ Save provided command line context for future use """
-        super(Core, cls)._save_context(context)
+        super(Core, cls)._save_cli_context(context)
 
         # Handle '.' as an alias for the current working directory
         names = cls._opt('names')
@@ -609,8 +712,7 @@ class Core(
             else:
                 # Prevent matching common prefix from other directories
                 pattern = f"{current.relative_to(root)}(/|$)"
-            assert cls._context is not None  # narrow type
-            cls._context.params['names'] = tuple(
+            cls._cli_options['names'] = tuple(
                 pattern if name == '.' else name for name in names)
 
     def name_and_summary(self) -> str:
@@ -690,19 +792,111 @@ class Core(
 
         return data
 
-    def lint_keys(self, additional_keys: List[str]) -> List[str]:
+    def _lint_keys(self, additional_keys: List[str]) -> List[str]:
         """ Return list of invalid keys used, empty when all good """
         known_keys = additional_keys + self._keys()
         return [key for key in self.node.get().keys() if key not in known_keys]
 
-    def _lint_summary(self) -> bool:
-        """ Lint summary attribute """
-        # Summary is advised with a resonable length
-        if self.summary is None:
-            verdict(None, "summary is very useful for quick inspection")
-        elif len(self.summary) > 50:
-            verdict(None, "summary should not exceed 50 characters")
-        return True
+    def lint_validate(self) -> LinterReturn:
+        """ C000: fmf node should pass the schema validation """
+
+        schema_name = self.__class__.__name__.lower()
+
+        errors = tmt.utils.validate_fmf_node(self.node, f'{schema_name}.yaml', self._logger)
+
+        if errors:
+            # A bit of error formatting. It is possible to use str(error), but the result
+            # is a bit too JSON-ish. Let's present an error message in a way that helps
+            # users to point finger on each and every issue.
+
+            def detect_unallowed_properties(error: jsonschema.ValidationError) -> LinterReturn:
+                match = re.search(
+                    r"(?mi)Additional properties are not allowed \(([a-zA-Z0-9', \-]+) (?:was|were) unexpected\)",  # noqa: E501
+                    str(error))
+
+                if not match:
+                    return
+
+                for bad_property in match.group(1).replace("'", '').replace(' ', '').split(','):
+                    yield LinterOutcome.WARN, \
+                        f'key "{bad_property}" not recognized by schema {error.schema["$id"]}'
+
+            # A key not recognized, but when patternProperties are allowed. In that case,
+            # the key is both not listed and not matching the pattern.
+            def detect_unallowed_properties_with_pattern(
+                    error: jsonschema.ValidationError) -> LinterReturn:
+                match = re.search(
+                    r"(?mi)'([a-zA-Z0-9', \-]+)' (?:does|do) not match any of the regexes: '([a-zA-Z0-9\-\^\+\*]+)'",  # noqa: E501
+                    str(error))
+
+                if not match:
+                    return
+
+                for bad_property in match.group(1).replace("'", '').replace(' ', '').split(','):
+                    yield LinterOutcome.WARN, \
+                        f'key "{bad_property}" not recognized by schema,' \
+                        f' and does not match "{match.group(2)}" pattern'
+
+            # A key value is not recognized. This is often a case with keys whose values are
+            # limited by an enum, like `how`. Unfortunatelly, validator will record every mismatch
+            # between a value and enum even if eventually a match is found. So it might be tempting
+            # to ignore this particular kind of error - it may also indicate a genuine typo in
+            # key name or completely misplaced key, so it's still necessary to report the error.
+            def detect_enum_violations(error: jsonschema.ValidationError) -> LinterReturn:
+                match = re.search(
+                    r"(?mi)'([a-z\-]+)' is not one of \['([a-zA-Z\-]+)'\]",
+                    str(error))
+
+                if not match:
+                    return
+
+                # Older jsonpatch packages may lack this attribute
+                if not hasattr(error, 'json_path'):
+                    json_path = '$'
+
+                    for elem in error.absolute_path:
+                        if isinstance(elem, int):
+                            json_path += f'[{elem}]'
+                        else:
+                            json_path += f'.{elem}'
+
+                else:
+                    json_path = error.json_path
+
+                yield LinterOutcome.WARN, \
+                    f'value of "{json_path.split(".")[-1]}" is not "{match.group(2)}"'
+
+            for error, _ in errors:
+                yield from detect_unallowed_properties(error)
+                yield from detect_unallowed_properties_with_pattern(error)
+                yield from detect_enum_violations(error)
+
+                # Validation errors can have "context", a list of "sub" errors encountered during
+                # validation. Interesting ones are identified & added to our error message.
+                if error.context:
+                    for suberror in error.context:
+                        yield from detect_unallowed_properties(suberror)
+                        yield from detect_unallowed_properties_with_pattern(suberror)
+                        yield from detect_enum_violations(suberror)
+
+            yield LinterOutcome.WARN, 'fmf node failed schema validation'
+
+            return
+
+        yield LinterOutcome.PASS, 'fmf node passes schema validation'
+
+    def lint_summary_exists(self) -> LinterReturn:
+        """ C001: summary key should be set and should be reasonably long """
+
+        if not self.summary:
+            yield LinterOutcome.WARN, 'summary key is missing'
+            return
+
+        if len(self.summary) > 50:
+            yield LinterOutcome.WARN, 'summary should not exceed 50 characters'
+            return
+
+        yield LinterOutcome.PASS, 'summary key is set and is reasonably long'
 
     def has_link(self, needle: 'LinkNeedle') -> bool:
         """ Whether object contains specified link """
@@ -716,7 +910,10 @@ class Core(
 Node = Core
 
 
-class Test(Core, tmt.export.Exportable['Test']):
+class Test(
+        Core,
+        tmt.export.Exportable['Test'],
+        tmt.lint.Lintable['Test']):
     """ Test object (L1 Metadata) """
 
     # Basic test information
@@ -739,6 +936,8 @@ class Test(Core, tmt.export.Exportable['Test']):
     serialnumber: int = 0
 
     returncode: Optional[int] = None
+    starttime: Optional[str] = None
+    endtime: Optional[str] = None
     real_duration: Optional[str] = None
     _reboot_count: int = 0
 
@@ -939,6 +1138,14 @@ class Test(Core, tmt.export.Exportable['Test']):
             path=script_path, content=content,
             name='test script', dry=dry, force=force, mode=0o755)
 
+    @property
+    def manual_test_path(self) -> Path:
+        assert self.manual, 'Test is not manual yet path to manual instructions was requested'
+
+        assert self.path
+
+        return Path(self.node.root) / self.path.unrooted() / str(self.test)
+
     def show(self) -> None:
         """ Show test details """
         self.ls()
@@ -970,89 +1177,170 @@ class Test(Core, tmt.export.Exportable['Test']):
                 if value not in [None, list(), dict()]:
                     echo(tmt.utils.format(key, value, key_color='blue'))
 
-    def _lint_manual(self, test_path: Path) -> bool:
-        """ Check that the manual instructions respect the specification """
-        # Manual tests should store a path to a document describing the test case steps.
-        manual_test = test_path / str(self.test)
+    # FIXME - Make additional attributes configurable
+    def lint_unknown_keys(self) -> LinterReturn:
+        """ T001: all keys are known """
 
-        # File does not exist
-        if not manual_test.exists():
-            return verdict(False, f"file '{self.test}' does not exist")
+        # We don't want adjust in show/export so it is not yet in Test._keys
+        invalid_keys = self._lint_keys(EXTRA_TEST_KEYS + OBSOLETED_TEST_KEYS + ['adjust'])
 
-        # Check syntax for warnings
-        warnings = tmt.export.check_md_file_respects_spec(manual_test)
-        if warnings:
-            for warning in warnings:
-                verdict(False, warning)
-            return False
+        if invalid_keys:
+            for key in invalid_keys:
+                yield LinterOutcome.FAIL, f'unknown key "{key}" is used'
 
-        # Everything looks ok
-        return verdict(True, f"correct manual test syntax in '{self.test}'")
+            return
 
-    def lint(self) -> bool:
-        """
-        Check test against the L1 metadata specification.
+        yield LinterOutcome.PASS, 'correct keys are used'
 
-        Return whether the test is valid.
-        """
-        self.ls()
-        assert self.path is not None  # narrow type
+    def lint_defined_test(self) -> LinterReturn:
+        """ T002: test script must be defined """
 
-        # Check test, path and summary (use bitwise '&' because 'and' is
-        # lazy and would skip all verdicts following the first fail)
-        valid = verdict(
-            bool(self.test), 'test script must be defined')
-        valid &= verdict(
-            self.path.is_absolute(), 'directory path must be absolute')
-        if self.path.is_absolute():
-            assert self.path is not None  # narrow type
-            test_path = Path(self.node.root) / self.path.unrooted()
-        else:
-            test_path = self.path
-        valid &= verdict(
-            test_path.exists(), 'directory path must exist')
-        self._lint_summary()
+        if not self.test:
+            yield LinterOutcome.FAIL, 'test script is not defined'
+            return
 
-        # Check for possible test case relevancy rules
+        yield LinterOutcome.PASS, 'test script is defined'
+
+    def lint_absolute_path(self) -> LinterReturn:
+        """ T003: test directory path must be absolute """
+
+        if not self.path:
+            yield LinterOutcome.FAIL, 'directory path is not set'
+            return
+
+        if not self.path.is_absolute():
+            yield LinterOutcome.FAIL, 'directory path is not absolute'
+            return
+
+        yield LinterOutcome.PASS, 'directory path is absolute'
+
+    def lint_path_exists(self) -> LinterReturn:
+        """ T004: test directory path must exist """
+
+        if not self.path:
+            yield LinterOutcome.FAIL, 'directory path is not set'
+            return
+
+        test_path = Path(self.node.root) / self.path.unrooted()
+
+        if not test_path.exists():
+            yield LinterOutcome.FAIL, f"test path '{test_path}' does not exist"
+            return
+
+        yield LinterOutcome.PASS, f"test path '{test_path}' does exist"
+
+    def lint_legacy_relevancy_rules(self) -> LinterReturn:
+        """ T005: relevancy has been obsoleted by adjust """
+
         filename = self.node.sources[-1]
         metadata = tmt.utils.yaml_to_dict(self.read(filename))
         relevancy = metadata.pop('relevancy', None)
-        if relevancy:
-            # Convert into adjust rules if --fix enabled
-            if self.opt('fix'):
-                metadata['adjust'] = tmt.convert.relevancy_to_adjust(relevancy)
-                self.write(filename, tmt.utils.dict_to_yaml(metadata))
-                verdict(None, 'relevancy converted into adjust')
-            else:
-                valid = verdict(
-                    False, 'relevancy has been obsoleted by adjust')
 
-        # Check for possible coverage attribute
+        if not relevancy:
+            yield LinterOutcome.SKIP, 'legacy relevancy not detected'
+            return
+
+        # Convert into adjust rules if --fix enabled
+        if not self.opt('fix'):
+            yield LinterOutcome.FAIL, 'relevancy has been obsoleted by adjust'
+            return
+
+        metadata['adjust'] = tmt.convert.relevancy_to_adjust(relevancy)
+        self.write(filename, tmt.utils.dict_to_yaml(metadata))
+
+        yield LinterOutcome.FIXED, 'relevancy converted into adjust'
+
+    def lint_legacy_coverage_key(self) -> LinterReturn:
+        """ T006: coverage has been obsoleted by link """
+
+        filename = self.node.sources[-1]
+        metadata = tmt.utils.yaml_to_dict(self.read(filename))
         coverage = metadata.pop('coverage', None)
-        if coverage:
-            valid = verdict(False, 'coverage has been obsoleted by link')
-        # Check for unknown attributes
-        # FIXME - Make additional attributes configurable
-        # We don't want adjust in show/export so it is not yet in Test._keys
-        invalid_keys = self.lint_keys(
-            EXTRA_TEST_KEYS + OBSOLETED_TEST_KEYS + ['adjust'])
-        if invalid_keys:
-            valid = False
-            for key in invalid_keys:
-                verdict(False, f"unknown attribute '{key}' is used")
-        else:
-            verdict(True, "correct attributes are used")
 
-        # Check if the format of Markdown file respects the specification
-        # https://tmt.readthedocs.io/en/latest/spec/tests.html#manual
-        if self.manual:
-            valid &= self._lint_manual(test_path)
+        if coverage is None:
+            yield LinterOutcome.SKIP, "legacy 'coverage' field not detected"
+            return
 
-        return valid
+        yield LinterOutcome.FAIL, "the 'coverage' field has been obsoleted by 'link'"
+
+    # Check if the format of Markdown file respects the specification
+    # https://tmt.readthedocs.io/en/latest/spec/tests.html#manual
+    def lint_manual_test_path_exists(self) -> LinterReturn:
+        """ T007: manual test path is not an actual path """
+
+        if not self.manual:
+            yield LinterOutcome.SKIP, 'not a manual test'
+            return
+
+        if not self.path:
+            yield LinterOutcome.FAIL, 'directory path is not set'
+            return
+
+        if not self.manual_test_path.exists():
+            yield LinterOutcome.FAIL, f'manual test path "{self.manual_test_path}" does not exist'
+            return
+
+        yield LinterOutcome.PASS, f'manual test path "{self.manual_test_path}" does exist'
+
+    def lint_manual_valid_markdown(self) -> LinterReturn:
+        """ T008: manual test should be valid markdown """
+
+        if not self.manual:
+            yield LinterOutcome.SKIP, 'not a manual test'
+            return
+
+        try:
+            warnings = tmt.export.check_md_file_respects_spec(self.manual_test_path)
+
+        except tmt.utils.ConvertError as exc:
+            yield LinterOutcome.FAIL, f'cannot open the manual test path: {exc}'
+            return
+
+        if warnings:
+            for warning in warnings:
+                # replace new-lines with a (single) space
+                yield LinterOutcome.WARN, ' '.join(line.strip() for line in warning.splitlines())
+
+            return
+
+        yield LinterOutcome.PASS, 'correct manual test syntax'
+
+    def lint_require_type_field(self) -> LinterReturn:
+        """ T009: require fields should have type field """
+
+        filename = self.node.sources[-1]
+        metadata = tmt.utils.yaml_to_dict(self.read(filename))
+        missing_type = []
+
+        # Check require items have type field
+        for require in metadata.get('require', []):
+            if isinstance(require, dict) and not require.get('type'):
+                missing_type.append(require)
+
+        if missing_type and not self.opt('fix'):
+            yield LinterOutcome.FAIL, 'requirements should specify type, library or file'
+            return
+
+        if missing_type:
+            for require in missing_type:
+                require['type'] = 'file' if require.get('pattern') else 'library'
+            self.write(filename, tmt.utils.dict_to_yaml(metadata))
+            yield LinterOutcome.FIXED, 'added type to requirements'
+            return
+
+        yield LinterOutcome.PASS, 'all requirements have type field'
 
 
-class Plan(Core, tmt.export.Exportable['Plan']):
+class Plan(
+        Core,
+        tmt.export.Exportable['Plan'],
+        tmt.lint.Lintable['Plan']):
     """ Plan object (L2 Metadata) """
+
+    # The class variable _cli_options need to be reassigned with a new empty
+    # dictionary instance. Otherwise, it would use the shared dictionary
+    # from Common class and causes error in certain cases.
+    _cli_options = {}
 
     # `environment` and `environment-file` are NOT promoted to instance variables.
     context: FmfContextType = {}
@@ -1132,7 +1420,7 @@ class Plan(Core, tmt.export.Exportable['Plan']):
         with tmt.utils.modify_environ(self.environment):
             self._expand_node_data(node.data, {
                 key: ','.join(value)
-                for (key, value) in self._fmf_context().items()})
+                for (key, value) in self._fmf_context.items()})
 
         # Initialize test steps
         self.discover = tmt.steps.discover.Discover(
@@ -1308,12 +1596,14 @@ class Plan(Core, tmt.export.Exportable['Plan']):
             f"Create the data directory '{self.data_directory}'.", level=2)
         self.data_directory.mkdir(exist_ok=True, parents=True)
 
+    @property
     def _fmf_context(self) -> tmt.utils.FmfContextType:
         """ Return combined context from plan data and command line """
-        combined = self.context.copy()
 
-        if self._context_object is not None:
-            combined.update(self._context_object.fmf_context)
+        combined = {}
+
+        combined.update(self.context)
+        combined.update(self._cli_fmf_context)
 
         return combined
 
@@ -1466,9 +1756,9 @@ class Plan(Core, tmt.export.Exportable['Plan']):
         if self.environment:
             echo(tmt.utils.format(
                 'environment', self.environment, key_color='blue'))
-        if self._fmf_context():
+        if self._fmf_context:
             echo(tmt.utils.format(
-                'context', self._fmf_context(), key_color='blue'))
+                'context', self._fmf_context, key_color='blue'))
 
         # The rest
         echo(tmt.utils.format('enabled', self.enabled, key_color='cyan'))
@@ -1499,106 +1789,120 @@ class Plan(Core, tmt.export.Exportable['Plan']):
             for key, value in fmf_id.items():
                 echo(tmt.utils.format(key, value, key_color='green'))
 
-    def _lint_execute(self) -> Optional[bool]:
-        """ Lint execute step """
-        execute = self.node.get('execute')
-        if not execute:
-            return verdict(False, "execute step must be defined with 'how'")
-        if isinstance(execute, dict):
-            execute = [execute]
+    # FIXME - Make additional attributes configurable
+    def lint_unknown_keys(self) -> LinterReturn:
+        """ P001: all keys are known """
 
-        methods = [
-            method.name
-            for method in tmt.steps.execute.ExecutePlugin.methods()]
-        correct = True
-        for configuration in execute:
-            how = configuration.get('how')
-            if how not in methods:
-                name = configuration.get('name')
-                verdict(False,
-                        f"unsupported execute method '{how}' in '{name}'")
-                correct = False
-
-        return correct
-
-    def _lint_discover(self) -> bool:
-        """ Lint discover step """
-        # TODO: can we use self.discover & its data instead? A question to be answered
-        # by better schema & lint cooperation - e.g. unknown methods shall be reported
-        # by schema-based validation already.
-
-        # The discover step is optional
-        # FIXME: cast() - typeless "dispatcher" method
-        discover_data = cast(Optional[tmt.steps.RawStepDataArgument], self.node.get('discover'))
-        if not discover_data:
-            return True
-        if not isinstance(discover_data, list):
-            discover_data = [discover_data]
-
-        methods = [
-            method.name
-            for method in tmt.steps.discover.DiscoverPlugin.methods()]
-        correct = True
-        for discover_datum in discover_data:
-            how = discover_datum.get('how')
-
-            if how not in methods:
-                correct = verdict(False, f"unknown discover method '{how}'")
-                continue
-
-            # FIXME Add check for the shell discover method
-            if how == 'shell':
-                continue
-
-            correct &= self._lint_discover_fmf(discover_datum)
-
-        return correct
-
-    @staticmethod
-    def _lint_discover_fmf(discover: tmt.steps._RawStepData) -> bool:
-        """ Lint fmf discover method """
-        # Validate remote id and translate to human readable errors
-        fmf_id_data = cast(
-            _RawFmfId,
-            {key: value for key, value in discover.items() if key in ['url', 'ref', 'path']}
-            )
-
-        # Skipping `name` on purpose - that belongs to the whole step,
-        # it's not treated as part of fmf id.
-        valid, error = FmfId.from_spec(fmf_id_data).validate()
-
-        if valid:
-            name = discover.get('name')
-            return verdict(True, f"fmf remote id in '{name}' is valid")
-
-        return verdict(False, error)
-
-    def lint(self) -> bool:
-        """
-        Check plan against the L2 metadata specification
-
-        Return whether the plan is valid.
-        """
-        self.ls()
-
-        # Explore all available plugins
-        tmt.plugins.explore()
-
-        invalid_keys = self.lint_keys(
-            list(self.step_names(enabled=True, disabled=True)) +
-            self.extra_L2_keys)
+        invalid_keys = self._lint_keys(
+            list(self.step_names(enabled=True, disabled=True)) + self.extra_L2_keys)
 
         if invalid_keys:
             for key in invalid_keys:
-                verdict(False, f"unknown attribute '{key}' is used")
-        else:
-            verdict(True, "correct attributes are used")
+                yield LinterOutcome.FAIL, f'unknown key "{key}" is used'
 
-        return all([
-            self._lint_summary(),
-            self._lint_execute(),
-            self._lint_discover(),
-            len(invalid_keys) == 0])
+            return
+
+        yield LinterOutcome.PASS, 'correct keys are used'
+
+    def lint_execute_not_defined(self) -> LinterReturn:
+        """ P002: execute step must be defined with "how" """
+
+        if not self.node.get('execute'):
+            yield LinterOutcome.FAIL, 'execute step must be defined with "how"'
+            return
+
+        yield LinterOutcome.PASS, 'execute step defined with "how"'
+
+    def _step_phase_nodes(self, step: str) -> List[Dict[str, Any]]:
+        """ List raw fmf nodes for the given step """
+
+        _phases = self.node.get(step)
+
+        if not _phases:
+            return []
+
+        if isinstance(_phases, dict):
+            return [_phases]
+
+        return cast(List[Dict[str, Any]], _phases)
+
+    def _lint_step_methods(
+            self,
+            step: str,
+            plugin_class: Type[tmt.steps.BasePlugin]) -> LinterReturn:
+        """ P003: execute step methods must be known """
+
+        phases = self._step_phase_nodes(step)
+
+        if not phases:
+            yield LinterOutcome.SKIP, f'{step} step is not defined'
+            return
+
+        methods = [method.name for method in plugin_class.methods()]
+
+        invalid_phases = [
+            phase
+            for phase in phases
+            if phase.get('how') not in methods
+            ]
+
+        if invalid_phases:
+            for phase in invalid_phases:
+                yield LinterOutcome.FAIL, \
+                    f'unknown {step} method "{phase.get("how")}" in "{phase.get("name")}"'
+
+            return
+
+        yield LinterOutcome.PASS, f'{step} step methods are all known'
+
+    # TODO: can we use self.discover & its data instead? A question to be answered
+    # by better schema & lint cooperation - e.g. unknown methods shall be reported
+    # by schema-based validation already.
+    def lint_execute_unknown_method(self) -> LinterReturn:
+        """ P003: execute step methods must be known """
+
+        yield from self._lint_step_methods('execute', tmt.steps.execute.ExecutePlugin)
+
+    def lint_discover_unknown_method(self) -> LinterReturn:
+        """ P004: discover step methods must be known """
+
+        yield from self._lint_step_methods('discover', tmt.steps.discover.DiscoverPlugin)
+
+    def lint_fmf_remote_ids_valid(self) -> LinterReturn:
+        """ P005: remote fmf ids must be valid """
+
+        fmf_ids: List[Tuple[FmfId, Dict[str, Any]]] = []
+
+        for phase in self._step_phase_nodes('discover'):
+            if phase.get('how') != 'fmf':
+                continue
+
+            # Skipping `name` on purpose - that belongs to the whole step,
+            # it's not treated as part of fmf id.
+            fmf_id_data = cast(
+                _RawFmfId,
+                {key: value for key, value in phase.items() if key in ['url', 'ref', 'path']}
+                )
+
+            if not fmf_id_data:
+                continue
+
+            fmf_ids.append((FmfId.from_spec(fmf_id_data), phase))
+
+        if fmf_ids:
+            for fmf_id, phase in fmf_ids:
+                valid, error = fmf_id.validate()
+
+                if valid:
+                    yield LinterOutcome.PASS, f'remote fmf id in "{phase.get("name")}" is valid'
+
+                else:
+                    yield LinterOutcome.FAIL, \
+                        f'remote fmf id in "{phase.get("name")}" is invalid, {error}'
+
+            return
+
+        yield LinterOutcome.SKIP, 'no remote fmf ids defined'
 
     def go(self) -> None:
         """ Execute the plan """
@@ -1612,7 +1916,7 @@ class Plan(Core, tmt.export.Exportable['Plan']):
         self.debug('info', color='cyan', shift=0, level=3)
         # TODO: something better than str()?
         self.debug('environment', str(self.environment), 'magenta', level=3)
-        self.debug('context', str(self._fmf_context()), 'magenta', level=3)
+        self.debug('context', str(self._fmf_context), 'magenta', level=3)
 
         # Wake up all steps
         self.debug('wake', color='cyan', shift=0, level=2)
@@ -1650,8 +1954,8 @@ class Plan(Core, tmt.export.Exportable['Plan']):
                 f'with the given options is not compatible: '
                 f'{fmf.utils.listed(standalone)}.')
         elif standalone:
-            assert self._context_object is not None  # narrow type
-            self._context_object.steps = standalone
+            assert self._cli_context_object is not None  # narrow type
+            self._cli_context_object.steps = standalone
             self.debug(
                 f"Running the '{list(standalone)[0]}' step as standalone.")
 
@@ -1705,7 +2009,7 @@ class Plan(Core, tmt.export.Exportable['Plan']):
             self.debug(f"Import remote plan '{plan_id.name}' from '{plan_id.url}'.", level=3)
 
             # Clone the whole git repository if executing tests (run is attached)
-            if self.my_run and not self.my_run.opt('dry') and not self.opt('dry'):
+            if self.my_run and not self.my_run.opt('dry'):
                 assert self.parent is not None  # narrow type
                 assert self.parent.workdir is not None  # narrow type
                 destination = self.parent.workdir / "import" / self.name.lstrip("/")
@@ -1768,7 +2072,10 @@ class StoryPriority(enum.Enum):
         return self.value
 
 
-class Story(Core, tmt.export.Exportable['Story']):
+class Story(
+        Core,
+        tmt.export.Exportable['Story'],
+        tmt.lint.Lintable['Story']):
     """ User story object """
 
     example: List[str] = []
@@ -1813,6 +2120,11 @@ class Story(Core, tmt.export.Exportable['Story']):
         super().__init__(node=node, logger=logger, skip_validation=skip_validation,
                          raise_on_validation_error=raise_on_validation_error, **kwargs)
         self._update_metadata()
+
+    # Override the parent implementation - it would try to call `Tree.storys()`...
+    @classmethod
+    def from_tree(cls, tree: 'tmt.Tree') -> List['Story']:
+        return tree.stories()
 
     @property
     def documented(self) -> List['Link']:
@@ -1942,30 +2254,33 @@ class Story(Core, tmt.export.Exportable['Story']):
         echo(self)
         return (code, test, docs)
 
-    def _lint_story(self) -> Optional[bool]:
-        story = self.node.get('story')
-        if not story:
-            return verdict(False, "story is required")
-        return True
+    # FIXME - Make additional attributes configurable
+    def lint_unknown_keys(self) -> LinterReturn:
+        """ S001: all keys are known """
 
-    def lint(self) -> bool:
-        """
-        Check story against the L3 metadata specification.
-
-        Return whether the story is valid.
-        """
-        self.ls()
-        invalid_keys = self.lint_keys(EXTRA_STORY_KEYS)
+        invalid_keys = self._lint_keys(EXTRA_STORY_KEYS)
 
         if invalid_keys:
             for key in invalid_keys:
-                verdict(False, f"unknown attribute '{key}' is used")
-        else:
-            verdict(True, "correct attributes are used")
+                yield LinterOutcome.FAIL, f'unknown key "{key}" is used'
 
-        return all([self._lint_summary(),
-                    self._lint_story(),
-                    len(invalid_keys) == 0])
+            return
+
+        yield LinterOutcome.PASS, 'correct keys are used'
+
+    def lint_story(self) -> LinterReturn:
+        """ S002: story key must be defined """
+
+        if not self.node.get('story'):
+            yield LinterOutcome.FAIL, 'story is required'
+            return
+
+        yield LinterOutcome.PASS, 'story key is defined'
+
+
+Test.discover_linters()
+Plan.discover_linters()
+Story.discover_linters()
 
 
 class Tree(tmt.utils.Common):
@@ -1975,7 +2290,7 @@ class Tree(tmt.utils.Common):
                  *,
                  path: Path = Path.cwd(),
                  tree: Optional[fmf.Tree] = None,
-                 context: Optional[tmt.utils.FmfContextType] = None,
+                 fmf_context: Optional[tmt.utils.FmfContextType] = None,
                  logger: tmt.log.Logger) -> None:
         """ Initialize tmt tree from directory path or given fmf tree """
 
@@ -1984,7 +2299,7 @@ class Tree(tmt.utils.Common):
 
         self._path = path
         self._tree = tree
-        self._custom_context = context
+        self._custom_fmf_context = fmf_context or {}
 
     @classmethod
     def grow(
@@ -1992,7 +2307,7 @@ class Tree(tmt.utils.Common):
             *,
             path: Path = Path.cwd(),
             tree: Optional[fmf.Tree] = None,
-            context: Optional[tmt.utils.FmfContextType] = None,
+            fmf_context: Optional[tmt.utils.FmfContextType] = None,
             logger: Optional[tmt.log.Logger] = None) -> 'Tree':
         """
         Initialize tmt tree from directory path or given fmf tree.
@@ -2009,19 +2324,20 @@ class Tree(tmt.utils.Common):
 
         import tmt.plugins
 
-        tmt.plugins.explore()
+        logger = logger or tmt.log.Logger.create()
+
+        tmt.plugins.explore(logger)
 
         return Tree(
             path=path,
             tree=tree,
-            context=context,
+            fmf_context=fmf_context,
             logger=logger or tmt.log.Logger.create())
 
+    @property
     def _fmf_context(self) -> FmfContextType:
         """ Use custom fmf context if provided, default otherwise """
-        if self._custom_context is not None:
-            return self._custom_context
-        return super()._fmf_context()
+        return self._custom_fmf_context or super()._fmf_context
 
     def _filters_conditions(
             self,
@@ -2086,7 +2402,6 @@ class Tree(tmt.utils.Common):
         """ Initialize tree only when accessed """
         if self._tree is None:
             try:
-                # TODO: fmf.Tree should get a stringified path
                 self._tree = fmf.Tree(str(self._path))
             except fmf.utils.RootError:
                 raise tmt.utils.MetadataError(
@@ -2095,7 +2410,7 @@ class Tree(tmt.utils.Common):
             except fmf.utils.FileError as error:
                 raise tmt.utils.GeneralError(f"Invalid yaml syntax: {error}")
             # Adjust metadata for current fmf context
-            self._tree.adjust(fmf.context.Context(**self._fmf_context()))
+            self._tree.adjust(fmf.context.Context(**self._fmf_context))
         return self._tree
 
     @tree.setter
@@ -2238,7 +2553,7 @@ class Tree(tmt.utils.Common):
                 logger=logger.descend(
                     logger_name=plan.get('name', None),
                     extra_shift=0
-                    ).apply_verbosity_options(**Plan._options),
+                    ).apply_verbosity_options(**Plan._cli_options),
                 run=run) for plan in [
                 *
                 self.tree.prune(
@@ -2393,24 +2708,24 @@ class Run(tmt.utils.Common):
                  *,
                  id_: Optional[Path] = None,
                  tree: Optional[Tree] = None,
-                 context: Optional['tmt.cli.Context'] = None,
+                 cli_context: Optional['tmt.cli.Context'] = None,
                  logger: tmt.log.Logger) -> None:
         """ Initialize tree, workdir and plans """
         # Use the last run id if requested
         self.config = tmt.utils.Config()
-        if context is not None:
-            if context.params.get('last'):
+        if cli_context is not None:
+            if cli_context.params.get('last'):
                 id_ = self.config.last_run
                 if id_ is None:
                     raise tmt.utils.GeneralError(
                         "No last run id found. Have you executed any run?")
-            if context.params.get('follow') and id_ is None:
+            if cli_context.params.get('follow') and id_ is None:
                 raise tmt.utils.GeneralError(
                     "Run id has to be specified in order to use --follow.")
         # Do not create workdir now, postpone it until later, as options
         # have not been processed yet and we do not want commands such as
         # tmt run discover --how fmf --help to create a new workdir.
-        super().__init__(context=context, logger=logger)
+        super().__init__(cli_context=cli_context, logger=logger)
         self._workdir_path: WorkdirArgumentType = id_ or True
         self._tree = tree
         self._plans: Optional[List[Plan]] = None
@@ -2480,11 +2795,11 @@ class Run(tmt.utils.Common):
     def save(self) -> None:
         """ Save list of selected plans and enabled steps """
         assert self.tree is not None  # narrow type
-        assert self._context_object is not None  # narrow type
+        assert self._cli_context_object is not None  # narrow type
         data = RunData(
             root=str(self.tree.root) if self.tree.root else None,
             plans=[plan.name for plan in self._plans] if self._plans is not None else None,
-            steps=list(self._context_object.steps),
+            steps=list(self._cli_context_object.steps),
             environment=self.environment,
             remove=self.remove
             )
@@ -2507,8 +2822,8 @@ class Run(tmt.utils.Common):
             self.debug('Run data not found.')
             return
         self._environment_from_workdir = data.environment
-        assert self._context_object is not None  # narrow type
-        self._context_object.steps = set(data.steps)
+        assert self._cli_context_object is not None  # narrow type
+        self._cli_context_object.steps = set(data.steps)
 
         self._plans = []
 
@@ -2557,9 +2872,9 @@ class Run(tmt.utils.Common):
         # Initialize steps only if not selected on the command line
         step_options = 'all since until after before skip'.split()
         selected = any(self.opt(option) for option in step_options)
-        assert self._context_object is not None  # narrow type
-        if not selected and not self._context_object.steps:
-            self._context_object.steps = set(data.steps)
+        assert self._cli_context_object is not None  # narrow type
+        if not selected and not self._cli_context_object.steps:
+            self._cli_context_object.steps = set(data.steps)
 
         # Store loaded environment
         self._environment_from_workdir = data.environment
@@ -2668,13 +2983,13 @@ class Run(tmt.utils.Common):
         # Propagate dry mode from provision to prepare, execute and finish
         # (basically nothing can be done if there is no guest provisioned)
         if tmt.steps.provision.Provision._opt("dry"):
-            tmt.steps.prepare.Prepare._options["dry"] = True
-            tmt.steps.execute.Execute._options["dry"] = True
-            tmt.steps.finish.Finish._options["dry"] = True
+            tmt.steps.prepare.Prepare._cli_options["dry"] = True
+            tmt.steps.execute.Execute._cli_options["dry"] = True
+            tmt.steps.finish.Finish._cli_options["dry"] = True
 
         # Enable selected steps
-        assert self._context_object is not None  # narrow type
-        enabled_steps = self._context_object.steps
+        assert self._cli_context_object is not None  # narrow type
+        enabled_steps = self._cli_context_object.steps
         all_steps = self.opt('all') or not enabled_steps
         since = self.opt('since')
         until = self.opt('until')
@@ -2854,14 +3169,14 @@ class Status(tmt.utils.Common):
         id_ = cast(str, self.opt('id'))
         root_path = Path(self.opt('workdir-root'))
         self.print_header()
-        assert self._context_object is not None  # narrow type
-        assert self._context_object.tree is not None  # narrow type
+        assert self._cli_context_object is not None  # narrow type
+        assert self._cli_context_object.tree is not None  # narrow type
         for abs_path in tmt.utils.generate_runs(root_path, id_):
             run = Run(
                 logger=self._logger,
                 id_=abs_path,
-                tree=self._context_object.tree,
-                context=self._context)
+                tree=self._cli_context_object.tree,
+                cli_context=self._cli_context)
             self.process_run(run)
 
 
@@ -2876,7 +3191,7 @@ class Clean(tmt.utils.Common):
                  parent: Optional[tmt.utils.Common] = None,
                  name: Optional[str] = None,
                  workdir: tmt.utils.WorkdirArgumentType = None,
-                 context: Optional['tmt.cli.Context'] = None,
+                 cli_context: Optional['tmt.cli.Context'] = None,
                  logger: tmt.log.Logger) -> None:
         """
         Initialize name and relation with the parent object
@@ -2884,9 +3199,14 @@ class Clean(tmt.utils.Common):
         Always skip to initialize the work tree.
         """
         # Set the option to skip to initialize the work tree
-        if context:
-            context.params[tmt.utils.PLAN_SKIP_WORKTREE_INIT] = True
-        super().__init__(logger=logger, parent=parent, name=name, workdir=workdir, context=context)
+        if cli_context:
+            cli_context.params[tmt.utils.PLAN_SKIP_WORKTREE_INIT] = True
+        super().__init__(
+            logger=logger,
+            parent=parent,
+            name=name,
+            workdir=workdir,
+            cli_context=cli_context)
 
     def images(self) -> bool:
         """ Clean images of provision plugins """
@@ -2931,9 +3251,8 @@ class Clean(tmt.utils.Common):
                         self.verbose(f"Stopping guests in run '{run.workdir}' "
                                      f"plan '{plan.name}'.", shift=1)
                         # Set --quiet to avoid finish logging to terminal
-                        assert self._context is not None  # narrow type
-                        quiet = self._context.params['quiet']
-                        self._context.params['quiet'] = True
+                        quiet = self._cli_options['quiet']
+                        self._cli_options['quiet'] = True
                         try:
                             plan.finish.go()
                         except tmt.utils.GeneralError as error:
@@ -2941,7 +3260,7 @@ class Clean(tmt.utils.Common):
                                       f"'{run.workdir}': {error}.", shift=1)
                             successful = False
                         finally:
-                            self._context.params['quiet'] = quiet
+                            self._cli_options['quiet'] = quiet
         return successful
 
     def guests(self) -> bool:
@@ -2953,15 +3272,16 @@ class Clean(tmt.utils.Common):
         if self.opt('last'):
             # Pass the context containing --last to Run to choose
             # the correct one.
-            return self._stop_running_guests(Run(logger=self._logger, context=self._context))
+            return self._stop_running_guests(
+                Run(logger=self._logger, cli_context=self._cli_context))
         successful = True
-        assert self._context_object is not None  # narrow type
+        assert self._cli_context_object is not None  # narrow type
         for abs_path in tmt.utils.generate_runs(root_path, id_):
             run = Run(
                 logger=self._logger,
                 id_=abs_path,
-                tree=self._context_object.tree,
-                context=self._context)
+                tree=self._cli_context_object.tree,
+                cli_context=self._cli_context)
             if not self._stop_running_guests(run):
                 successful = False
         return successful
@@ -2988,7 +3308,7 @@ class Clean(tmt.utils.Common):
         if self.opt('last'):
             # Pass the context containing --last to Run to choose
             # the correct one.
-            last_run = Run(logger=self._logger, context=self._context)
+            last_run = Run(logger=self._logger, cli_context=self._cli_context)
             last_run._workdir_load(last_run._workdir_path)
             assert last_run.workdir is not None  # narrow type
             return self._clean_workdir(last_run.workdir)
@@ -3305,7 +3625,7 @@ def resolve_dynamic_ref(
         raise tmt.utils.FileError(f"Failed to read '{ref_filepath}'.") from error
     # Build a dynamic reference tree, adjust ref based on the context
     reference_tree = fmf.Tree(data=data)
-    reference_tree.adjust(fmf.context.Context(**plan._fmf_context()))
+    reference_tree.adjust(fmf.context.Context(**plan._fmf_context))
     # Also temporarily build a plan so that env and context variables are expanded
     Plan(logger=logger, node=reference_tree, run=plan.my_run, skip_validation=True)
     ref = reference_tree.get("ref")
