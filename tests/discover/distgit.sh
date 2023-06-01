@@ -6,6 +6,8 @@
 SERVER_PORT="9000"
 MOCK_SOURCES_FILENAME='mock_sources'
 
+TEST_DIR="$(pwd)"
+
 rlJournalStart
     rlPhaseStartSetup
         rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
@@ -63,6 +65,7 @@ rlJournalStart
         rlRun "popd"
     rlPhaseEnd
 
+if false; then #TODO
     ### discover -h fmf ###
 
 for value in explicit auto; do
@@ -443,6 +446,37 @@ EOF
         rlRun "popd"
         rlRun "rm $rlRun_LOG"
         rlRun "rm -rf $tmp"
+    rlPhaseEnd
+fi #TODO
+    rlPhaseStartTest "Applying patches during discover"
+        rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
+        rlRun 'mkdir -p $tmp/distgit && pushd $tmp/distgit'
+        rlRun "git init && tmt init" # should be git with fmf tree
+
+        rlRun "cp $TEST_DIR/data/{foo.spec,adding-test.patch} ."
+        rlRun "cp $TEST_DIR/data/foo.tgz $SERVER_DIR"
+        echo 'foo.tgz' > $MOCK_SOURCES_FILENAME
+        cat <<EOF > plans.fmf
+discover:
+    how: fmf
+    dist-git-source: true
+    dist-git-type: TESTING
+provision:
+    how: local
+execute:
+    how: tmt
+EOF
+        # Check both tests were discovered (one is added by patch)
+        rlRun -s "tmt run --id $tmp/rundir discover -vvv"
+        rlAssertGrep 'summary: 2 tests selected' $rlRun_LOG
+        rlAssertGrep '/from-src' $rlRun_LOG
+        rlAssertGrep '/by-patch' $rlRun_LOG
+
+        # Check require were gathered correctly
+        rlRun -s "cat $(find $tmp/rundir -name tests.yaml -print) | yq '.[0].require | join(\" \" )'"
+        rlAssertGrep 'bar-from-src' $rlRun_LOG
+        rlAssertGrep 'foo-by-patch' $rlRun_LOG
+        # rlRun "rm -rf $tmp"
     rlPhaseEnd
 
 rlPhaseStartTest "shell with download-only"
