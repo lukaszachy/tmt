@@ -1,0 +1,9 @@
+discover:
+    how: shell
+    tests:
+        - name: /
+          test: echo
+    dist-git-source: true
+    
+execute:
+    how: tmt    

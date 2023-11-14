@@ -228,6 +228,7 @@ class Prepare(tmt.steps.Step):
                     ],
                 'missing': 'skip'}
             self._phases.append(PreparePlugin.delegate(self, raw_data=data))
+            # NOTE ... kind of like this
 
         # Prepare guests (including workdir sync)
         guest_copies: List[Guest] = []

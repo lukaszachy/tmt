@@ -65,7 +65,7 @@ rlJournalStart
         rlRun "popd"
     rlPhaseEnd
 
-if false; then #TODO
+if false; then #TODO - remove
     ### discover -h fmf ###
 
 for value in explicit auto; do
@@ -447,8 +447,9 @@ EOF
         rlRun "rm $rlRun_LOG"
         rlRun "rm -rf $tmp"
     rlPhaseEnd
-fi #TODO
-    rlPhaseStartTest "Applying patches during discover"
+fi #TODO - remove
+if false; then #TODO - remove
+    rlPhaseStartTest "Discover and applied patches (fmf)"
         rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
         rlRun 'mkdir -p $tmp/distgit && pushd $tmp/distgit'
         rlRun "git init && tmt init" # should be git with fmf tree
@@ -477,6 +478,37 @@ EOF
         rlAssertGrep 'bar-from-src' $rlRun_LOG
         rlAssertGrep 'foo-by-patch' $rlRun_LOG
         # rlRun "rm -rf $tmp"
+    rlPhaseEnd
+fi
+
+    rlPhaseStartTest "Discover and applied patches (shell)"
+        rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
+        rlRun 'mkdir -p $tmp/distgit && pushd $tmp/distgit'
+        rlRun "git init && tmt init" # should be git with fmf tree
+
+        rlRun "cp $TEST_DIR/data/{foo.spec,adding-test.patch} ."
+        rlRun "cp $TEST_DIR/data/foo.tgz $SERVER_DIR"
+        echo 'foo.tgz' > $MOCK_SOURCES_FILENAME
+        cat <<EOF > plans.fmf
+discover:
+    how: shell
+    dist-git-source: true
+    dist-git-type: TESTING
+    test:
+    - name: foo
+      test: echo
+provision:
+    how: local
+execute:
+    how: tmt
+EOF
+        # Prepare is required to apply patches ... warning should be printed
+        rlRun -s "tmt run --scratch --id $tmp/rundir discover -vvv"
+        rlFail "Missing asserts"
+
+        # Prepare is required to apply patches ... warning should be printed
+        rlRun -s "tmt run --scratch --id $tmp/rundir -vvv --until execute"
+        rlFail "Missing asserts"
     rlPhaseEnd
 
 rlPhaseStartTest "shell with download-only"
