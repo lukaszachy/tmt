@@ -4770,12 +4770,11 @@ def distgit_download(
         distgit_dir: Path,
         target_dir: Path,
         handler_name: Optional[str] = None,
-        download_only: bool = False,
         caller: Optional['Common'] = None,
         logger: tmt.log.Logger
         ) -> None:
     """
-    Download sources to the target_dir and possibly extract tarballs
+    Download sources to the target_dir
 
     distgit_dir is path to the DistGit repository
     """
@@ -4792,9 +4791,6 @@ def distgit_download(
     else:
         handler = tmt.utils.get_distgit_handler(usage_name=handler_name)
 
-    # Download (and extract) sources
-    # TODO extract will become 'rpmbuild -bp' in the (hopefully near) future
-    # and will be removed from this function
     for url, source_name in handler.url_and_name(distgit_dir):
         logger.debug(f"Download sources from '{url}'.")
         with tmt.utils.retry_session() as session:
@@ -4803,12 +4799,6 @@ def distgit_download(
         target_dir.mkdir(exist_ok=True, parents=True)
         with open(target_dir / source_name, 'wb') as tarball:
             tarball.write(response.content)
-        if download_only or not handler.re_supported_extensions.search(source_name):
-            continue
-        cmd = Command("tar", "--auto-compress", "--extract", "-f", source_name)
-        cmd.run(cwd=target_dir,
-                caller=caller,
-                logger=logger)
 
 
 def git_clone(

@@ -1,7 +1,5 @@
 import dataclasses
-from typing import Any, Dict, List, Optional, cast
-
-import fmf
+from typing import Any, List, Optional
 
 import tmt
 import tmt.log
@@ -9,41 +7,61 @@ import tmt.steps
 import tmt.steps.prepare
 import tmt.utils
 from tmt.steps.provision import Guest
-from tmt.utils import ShellScript, field, Command
+from tmt.utils import Command, Path, field
 
 PREPARE_WRAPPER_FILENAME = 'tmt-prepare-wrapper.sh'
 
 
 @dataclasses.dataclass
-class DistGitData(tmt.steps.prepare.PrepareStepData):
-    script: List[ShellScript] = field(
-        default_factory=list,
-        option=('-s', '--script'),
-        multiple=True,
-        metavar='SCRIPT',
-        help='Shell script to be executed. Can be used multiple times.',
-        normalize=tmt.utils.normalize_shell_script_list,
-        serialize=lambda scripts: [str(script) for script in scripts],
-        unserialize=lambda serialized: [ShellScript(script) for script in serialized]
+class ExtractDistGitData(tmt.steps.prepare.PrepareStepData):
+    source_dir: Optional[Path] = field(
+        default=None,
+        option='--source-dir',
+        normalize=tmt.utils.normalize_path,
+        exporter=lambda value: str(value) if isinstance(value, Path) else None)
+    phase_name: str = field(default_factory=str, option='--phase-name')
+    order: int = 60
+    install_builddeps: bool = field(
+        default=False,
+        option="--install-builddeps",
+        is_flag=True,
+        help="Install package build dependencies",
         )
-
-    # ignore[override] & cast: two base classes define to_spec(), with conflicting
-    # formal types.
-    def to_spec(self) -> Dict[str, Any]:  # type: ignore[override]
-        data = cast(Dict[str, Any], super().to_spec())
-        data['script'] = [str(script) for script in self.script]
-
-        return data
+    require: List['tmt.base.DependencySimple'] = field(
+        default_factory=list,
+        option="--require",
+        metavar='PACKAGE',
+        multiple=True,
+        help='Additional required package to be present before sources are prepared',
+        # *simple* requirements only
+        normalize=lambda key_address, value, logger: tmt.base.assert_simple_dependencies(
+            tmt.base.normalize_require(key_address, value, logger),
+            "'require' can be simple packages only",
+            logger),
+        serialize=lambda packages: [package.to_spec() for package in packages],
+        unserialize=lambda serialized: [
+            tmt.base.DependencySimple.from_spec(package)
+            for package in serialized
+            ]
+        )
 
 
 @tmt.steps.provides_method('distgit')
-class PrepareShell(tmt.steps.prepare.PreparePlugin[DistGitData]):
+class PrepareExtractDistGit(tmt.steps.prepare.PreparePlugin[ExtractDistGitData]):
     """
     Companion to the discover-dist-git
 
     """
 
-    _data_class = DistGitData
+    _data_class = ExtractDistGitData
+
+    def __init__(
+            self,
+            *,
+            discover: Optional['tmt.steps.discover.DiscoverPlugin'] = None,
+            **kwargs: Any):
+        super().__init__(**kwargs)
+        self.discover: discover
 
     def go(
             self,
@@ -52,70 +70,60 @@ class PrepareShell(tmt.steps.prepare.PreparePlugin[DistGitData]):
             environment: Optional[tmt.utils.EnvironmentType] = None,
             logger: tmt.log.Logger) -> None:
         """ Prepare the guests """
+
         super().go(guest=guest, environment=environment, logger=logger)
 
         environment = environment or {}
 
+        # Install packages required for this plugin to work and additional required packages
+        additional_require = [*self.get('require', []), 'rpm-build']
 
-        # Install build require
-        install_build_require: bool = self.get('install-build-require')
+        data = tmt.steps.prepare.install.PrepareInstallData(
+            package=additional_require,
+            name='unused',
+            how='unused'
+            )
+        prepare_install = tmt.steps.prepare.install.PrepareInstall(
+            step=self.parent,
+            data=data,
+            workdir=None,
+            logger=self._logger,
+            )
+        # FIXME -- use correct guest.facts
+        installer = tmt.steps.prepare.install.InstallDnf(
+            logger=logger, parent=prepare_install, guest=guest)
+        installer.install()
 
-        if install_build_require:
-        ## rpmbuild --define '_topdir $(TMP)' -br tmt.spec || sudo dnf builddep -y $(TMP)/SRPMS/tmt-*buildreqs.nosrc.rpm
-            Command("rpmbuild", "--define", f"_topdir {XX}", "-br", "{SPEC}" )
-        
+        # TODO
+        # install_build_require: bool = self.get('install_builddeps')
+        # rpmbuild -br spec
+        # dnf-build-dep <spec from previous step>
 
+        source_dir = self.data.source_dir
+        assert source_dir
 
-        # Run rpmbuild -bp
-        Command("rpmbuild", "-bp", ) #NODEPS
-        # Pull sources
-        # Re-discover for how: fmf (it should asked for it)
+        try:
+            spec_name = next(Path(source_dir).glob('*.spec')).name
+        except StopIteration:
+            raise tmt.utils.PrepareError(f"No '*.spec' file found in '{source_dir}'")
 
-        # Give a short summary
-        scripts: List[tmt.utils.ShellScript] = self.get('script')
-        overview = fmf.utils.listed(scripts, 'script')
-        logger.info('overview', f'{overview} found', 'green')
+        cmd = Command(
+            "rpmbuild", "-bp", spec_name, "--nodeps",
+            "--define", f'_sourcedir {source_dir}',
+            "--define", f'_builddir {source_dir}'
+            )
 
-        workdir = self.step.plan.worktree
-        assert workdir is not None  # narrow type
+        try:
+            guest.execute(command=cmd,
+                          cwd=source_dir,
+                          )
+        except tmt.utils.RunError as error:
+            raise tmt.utils.PrepareError("Unable to 'rpmbuild -bp'", causes=[error])
 
-        if not self.is_dry_run:
-            topology = tmt.steps.Topology(self.step.plan.provision.guests())
-            topology.guest = tmt.steps.GuestTopology(guest)
+        # Make sure to pull back sources ...
+        guest.pull(source_dir)
 
-            # Since we do not have the test data dir at hand, we must make the topology
-            # filename unique on our own, and include the phase name and guest name.
-            filename_base = f'{tmt.steps.TEST_TOPOLOGY_FILENAME_BASE}-{self.safe_name}-{guest.safe_name}'  # noqa: E501
-
-            environment.update(
-                topology.push(
-                    dirpath=workdir,
-                    guest=guest,
-                    logger=logger,
-                    filename_base=filename_base))
-
-        prepare_wrapper_filename = f'{PREPARE_WRAPPER_FILENAME}-{self.safe_name}-{guest.safe_name}'
-        prepare_wrapper_path = workdir / prepare_wrapper_filename
-
-        logger.debug('prepare wrapper', prepare_wrapper_path, level=3)
-
-        # Execute each script on the guest (with default shell options)
-        for script in scripts:
-            logger.verbose('script', script, 'green')
-            script_with_options = tmt.utils.ShellScript(f'{tmt.utils.SHELL_OPTIONS}; {script}')
-            self.write(prepare_wrapper_path, str(script_with_options), 'w')
-            if not self.is_dry_run:
-                prepare_wrapper_path.chmod(0o755)
-            guest.push(
-                source=prepare_wrapper_path,
-                destination=prepare_wrapper_path,
-                options=["-s", "-p", "--chmod=755"])
-            command: ShellScript
-            if guest.become and not guest.facts.is_superuser:
-                command = tmt.utils.ShellScript(f'sudo -E {prepare_wrapper_path}')
-            else:
-                command = tmt.utils.ShellScript(f'{prepare_wrapper_path}')
-            guest.execute(
-                command=command,
-                cwd=workdir,
-                env=environment)
+        # When discover is not set we do not run anything else
+        if self.discover is None:
+            return
+        raise NotImplementedError

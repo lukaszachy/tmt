@@ -26,7 +26,7 @@ class DiscoverStepData(tmt.steps.WhereableStepData, tmt.steps.StepData):
         default=False,
         option='--dist-git-source',
         is_flag=True,
-        help='Download DistGit sources and extract the tarballs (can be skipped).'
+        help='Download DistGit sources and `rpmbuild -bp` them (can be skipped).'
         )
 
     # TODO: use enum!
@@ -41,7 +41,33 @@ class DiscoverStepData(tmt.steps.WhereableStepData, tmt.steps.StepData):
         default=False,
         option="--dist-git-download-only",
         is_flag=True,
-        help="Do not extract downloaded sources.",
+        help="Just downloaded sources.",
+        )
+
+    # TODO -- for now user can use 'require'
+    # dist_git_install_builddeps: bool = field(
+    #     default=False,
+    #     option="--dist-git-install-builddeps",
+    #     is_flag=True,
+    #     help="Install package build dependencies",
+    #     )
+
+    dist_git_require: List['tmt.base.DependencySimple'] = field(
+        default_factory=list,
+        option="--dist-git-require",
+        metavar='PACKAGE',
+        multiple=True,
+        help='Additional required package to be present before sources are prepared',
+        # *simple* requirements only
+        normalize=lambda key_address, value, logger: tmt.base.assert_simple_dependencies(
+            tmt.base.normalize_require(key_address, value, logger),
+            "'dist_git_require' can be simple packages only",
+            logger),
+        serialize=lambda packages: [package.to_spec() for package in packages],
+        unserialize=lambda serialized: [
+            tmt.base.DependencySimple.from_spec(package)
+            for package in serialized
+            ]
         )
 
 
@@ -95,23 +121,20 @@ class DiscoverPlugin(tmt.steps.GuestlessPlugin[DiscoverStepDataT]):
         """
         raise NotImplementedError
 
-    def extract_distgit_source(
+    def download_distgit_source(
             self,
             distgit_dir: Path,
             target_dir: Path,
-            handler_name: Optional[str] = None,
-            download_only: bool = False) -> None:
+            handler_name: Optional[str] = None) -> None:
         """
-        Download sources to the target_dir and possibly extract the tarballs
+        Download sources to the target_dir
 
         distgit_dir is path to the DistGit repository
-        Set download_only if extraction should not happen
         """
         tmt.utils.distgit_download(
             distgit_dir=distgit_dir,
             target_dir=target_dir,
             handler_name=handler_name,
-            download_only=download_only,
             caller=self,
             logger=self._logger
             )
@@ -148,6 +171,9 @@ class Discover(tmt.steps.Step):
 
         # Collection of discovered tests
         self._tests: Dict[str, List[tmt.Test]] = {}
+
+        # FIXME
+        self.extract_tests_later: bool = False
 
     def load(self) -> None:
         """ Load step data from the workdir """

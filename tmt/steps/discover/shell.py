@@ -12,6 +12,7 @@ import tmt.log
 import tmt.steps
 import tmt.steps.discover
 import tmt.utils
+from tmt.steps.prepare.distgit import ExtractDistGitData, PrepareExtractDistGit
 from tmt.utils import Command, Path, SerializableContainer, ShellScript, SpecBasedContainer, field
 
 T = TypeVar('T', bound='TestDescription')
@@ -379,15 +380,43 @@ class DiscoverShell(tmt.steps.discover.DiscoverPlugin[DiscoverShellData]):
                     f"Directory '{self.step.plan.my_run.tree.root}' "
                     f"is not a git repository.")
             try:
-                self.extract_distgit_source(
+                download_only: bool = self.get('dist-git-download-only')
+                self.download_distgit_source(
                     distgit_dir=git_root,
                     target_dir=sourcedir,
                     handler_name=self.get('dist-git-type'),
-                    download_only=self.get('dist-git-download-only'),
                     )
                 # Copy rest of files so TMT_SOURCE_DIR has patches, sources and spec file
                 # FIXME 'worktree' could be used as sourcedir when 'url' is not set
                 shutil.copytree(git_root, sourcedir, symlinks=True, dirs_exist_ok=True)
+
+                if download_only:
+                    self.debug("Do not extract sources as 'download_only' is set")
+                else:
+                    assert self.parent is not None  # narrow type
+                    assert self.parent.plan is not None  # narrow type
+                    # Check if prepare is enabled, warn user if not
+                    if not self.parent.plan.prepare.enabled:
+                        self.warn("Sources will not be extracted, prepare step is not enabled")
+                    where = cast(tmt.steps.discover.DiscoverStepData, self.data).where
+                    self.parent.plan.prepare._phases.append(
+                        PrepareExtractDistGit(
+                            step=self.parent.plan.prepare,
+                            data=ExtractDistGitData(
+                                where=where,
+                                source_dir=sourcedir,
+                                phase_name=self.name,
+                                install_builddeps=self.get('dist-git-install-builddeps'),
+                                require=self.get('dist-git-require'),
+                                how='unused',
+                                name="unused",
+                                ),
+                            workdir=None,
+                            discover=None,  # No need to rediscover tests
+                            logger=self._logger.descend(logger_name="extract-distgit")
+                            )
+                        )
+
             except Exception as error:
                 raise tmt.utils.DiscoverError(
                     "Failed to process 'dist-git-source'.") from error

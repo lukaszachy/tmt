@@ -838,7 +838,6 @@ class Step(tmt.utils.MultiInvokableCommon, tmt.export.Exportable['Step']):
             debug(f'final step data #{i}', str(datum))
 
     def setup_actions(self) -> None:
-        breakpoint()
         """ Insert login and reboot plugins if requested """
         for login_plugin in Login.plugins(step=self):
             self.debug(

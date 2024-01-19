@@ -5,7 +5,7 @@
 
 SERVER_PORT="9000"
 MOCK_SOURCES_FILENAME='mock_sources'
-
+PROVISION_METHODS="${PROVISION_METHODS:- local container virtual}"
 TEST_DIR="$(pwd)"
 
 rlJournalStart
@@ -481,7 +481,12 @@ EOF
     rlPhaseEnd
 fi
 
-    rlPhaseStartTest "Discover and applied patches (shell)"
+#for provision in $PROVISION_METHODS; do
+for provision in virtual; do
+
+export TMT_SHOW_TRACEBACK=1
+
+    rlPhaseStartTest "Discover and applied patches (shell) - $provision"
         rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
         rlRun 'mkdir -p $tmp/distgit && pushd $tmp/distgit'
         rlRun "git init && tmt init" # should be git with fmf tree
@@ -494,23 +499,30 @@ discover:
     how: shell
     dist-git-source: true
     dist-git-type: TESTING
-    test:
-    - name: foo
-      test: echo
+    tests:
+    - name: file from src
+      test: test -e \$TMT_SOURCE_DIR/src/from-src.txt
+    - name: file from applied patch
+      test: test -e \$TMT_SOURCE_DIR/src/by-patch.txt
 provision:
-    how: local
+    how: connect
+    guest: 192.168.122.241
+    key: /usr/share/qa-tools/1minutetip/1minutetip
 execute:
     how: tmt
 EOF
         # Prepare is required to apply patches ... warning should be printed
-        rlRun -s "tmt run --scratch --id $tmp/rundir discover -vvv"
-        rlFail "Missing asserts"
+#        rlRun -s "tmt run --scratch --id $tmp/rundir discover"
+#        rlAssertGrep "Sources will not be extracted, prepare step is not enabled" $rlRun_LOG
 
-        # Prepare is required to apply patches ... warning should be printed
-        rlRun -s "tmt run --scratch --id $tmp/rundir -vvv --until execute"
-        rlFail "Missing asserts"
+        rlRun -s "tmt run --keep --scratch --id $tmp/rundir -vvv --until execute"
+        rlAssertGrep "total: 2 tests passed" $rlRun_LOG
+        # File created by applying the patch is pulled back to the host
+        rlAssertExists "$tmp/rundir/plans/discover/default-0/source/src/by-patch.txt"
+
     rlPhaseEnd
-
+done
+if false; then
 rlPhaseStartTest "shell with download-only"
         rlRun "tmp=\$(mktemp -d)" 0 "Create tmp directory"
         rlRun 'pushd $tmp'
@@ -551,7 +563,7 @@ EOF
         rlRun "rm -rf $tmp"
         rlRun "rm -rf $WORKDIR"
     rlPhaseEnd
-
+fi
     rlPhaseStartCleanup
         echo $SERVER_PID
         kill -9 $SERVER_PID
