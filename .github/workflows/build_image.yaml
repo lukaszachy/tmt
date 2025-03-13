@@ -6,17 +6,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: ls
+        run: ls
+
       - name: Buildah Build - tmt
         uses: redhat-actions/buildah-build@v2.13
         with:
           image: tmt-all
           tags: latest
           containerfiles: ./containers/Containerfile.mini
-      - name: Buildah Build - tmt-all
-        uses: redhat-actions/buildah-build@v2.13
-        with:
-          image: tmt-all
-          tags: latest
-          containerfiles: ./containers/Containerfile.full
-
-          
