@@ -7,12 +7,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - run: ls
-      - run: echo other
-      - run: ls /home/runner/work/tmt/tmt
       - name: Buildah Build - tmt
         uses: redhat-actions/buildah-build@v2.13
         with:
-          image: tmt-all
+          image: tmt
           tags: latest
-          containerfiles: ./containers/Containerfile.mini
+          containerfiles: ./containers/Dockerfile.mini
