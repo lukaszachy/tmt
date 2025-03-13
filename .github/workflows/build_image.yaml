@@ -9,7 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: ls
       - run: echo other
-      - run: /home/runner/work/tmt/tmt
+      - run: ls /home/runner/work/tmt/tmt
       - name: Buildah Build - tmt
         uses: redhat-actions/buildah-build@v2.13
         with:
