@@ -6,9 +6,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ls
-        run: ls
-
+      - uses: actions/checkout@v4
       - name: Buildah Build - tmt
         uses: redhat-actions/buildah-build@v2.13
         with:
