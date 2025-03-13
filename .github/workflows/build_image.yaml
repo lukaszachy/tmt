@@ -11,7 +11,7 @@ jobs:
         uses: redhat-actions/buildah-build@v2.13
         id: build-image-tmt
         with:
-          image: tmt
+          image: just-trying
           tags: latest
           containerfiles: ./containers/Dockerfile.mini
       - name: Push To quay.io - tmt
